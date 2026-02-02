@@ -30,7 +30,7 @@ BUTTON_COLOR = (200, 100, 0)
 BUTTON_HOVER = (255, 150, 0)
 RED_ALERT = (255, 80, 80)  # 新增：时间不足的警示颜色
 
-# 动作常量（和AI统一，0-8，游戏只负责映射执行）
+# 动作常量（和AI统一，0-7，移除未使用的ACTION_MOVE_AIM，避免AI维度不匹配）
 ACTION_IDLE = 0
 ACTION_UP = 1
 ACTION_DOWN = 2
@@ -39,7 +39,6 @@ ACTION_RIGHT = 4
 ACTION_GUN_LEFT = 5
 ACTION_GUN_RIGHT = 6
 ACTION_SHOOT = 7
-ACTION_MOVE_AIM = 8
 
 # ====================== 工具函数（游戏内部使用） =======================
 def deg2rad(deg):
@@ -171,13 +170,14 @@ class Tank:
 # ====================== 核心游戏类（暴露AI接口，可独立运行） =======================
 class TankGame:
     def __init__(self, render=True):
-        self.render = render
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT)) if self.render else None
+        # 修复点1：重命名布尔属性，避免和render方法重名（核心解决bool不可调用错误）
+        self.is_render = render
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT)) if self.is_render else None
         self.clock = pygame.time.Clock()
-        self.small_font = pygame.font.SysFont(None, 36) if self.render else None
-        self.big_font = pygame.font.SysFont(None, 80) if self.render else None
-        self.button_font = pygame.font.SysFont(None, 48) if self.render else None
-        if self.render:
+        self.small_font = pygame.font.SysFont(None, 36) if self.is_render else None
+        self.big_font = pygame.font.SysFont(None, 80) if self.is_render else None
+        self.button_font = pygame.font.SysFont(None, 48) if self.is_render else None
+        if self.is_render:
             pygame.display.set_caption("坦克大战 - 带时间限制+敌方精准瞄准")
         self.restart_btn = pygame.Rect(SCREEN_WIDTH//2 - 100, SCREEN_HEIGHT//2 + 50, 200, 60)
         self.game_over = False
@@ -212,12 +212,13 @@ class TankGame:
         return walls
 
     def _get_nearest_enemy(self):
-        if not self.enemies: return None
-        distances = [distance_between(self.player.x, self.player.y, e.x, e.y) for e in self.enemies]
-        return self.enemies[np.argmin(distances)]
+        if not [e for e in self.enemies if e.alive]: return None
+        enemies_alive = [e for e in self.enemies if e.alive]
+        distances = [distance_between(self.player.x, self.player.y, e.x, e.y) for e in enemies_alive]
+        return enemies_alive[np.argmin(distances)]
 
     def get_state(self):
-        """AI核心接口1：获取14维归一化游戏状态，返回np.array"""
+        """AI核心接口1：获取14维归一化游戏状态，返回list（适配AI的torch张量转换）"""
         state = np.zeros(14, dtype=np.float32)
         player = self.player
         enemy = self._get_nearest_enemy()
@@ -246,14 +247,16 @@ class TankGame:
         wall_dists = [distance_between(player.x, player.y, w[0]+WALL_SIZE//2, w[1]+WALL_SIZE//2) for w in self.walls]
         state[12] = normalize(min(wall_dists), 0, screen_diag) if wall_dists else 1.0
         state[13] = normalize(self.score, 0, 1000)
-        return state
+        # 适配点：返回list而非np.array，避免AI代码中张量转换报错
+        return state.tolist()
 
     def do_action(self, action):
-        """AI核心接口2：执行AI的动作指令（0-8），游戏内部映射执行"""
+        """AI核心接口2：执行AI的动作指令（0-7），游戏内部映射执行"""
         if not self.player.alive or self.game_over: return
         dx, dy, d_angle = 0, 0, 0
         shoot = False
 
+        # 适配点：只保留AI定义的0-7动作，移除未使用的ACTION_MOVE_AIM
         if action == ACTION_UP: dy = -1
         elif action == ACTION_DOWN: dy = 1
         elif action == ACTION_LEFT: dx = -1
@@ -261,16 +264,6 @@ class TankGame:
         elif action == ACTION_GUN_LEFT: d_angle = deg2rad(3)
         elif action == ACTION_GUN_RIGHT: d_angle = -deg2rad(3)
         elif action == ACTION_SHOOT: shoot = True
-        elif action == ACTION_MOVE_AIM:
-            enemy = self._get_nearest_enemy()
-            if enemy:
-                dx, dy = enemy.x - self.player.x, enemy.y - self.player.y
-                dx, dy = normalize_vector(dx, dy)
-                dx, dy = int(np.sign(dx)), int(np.sign(dy))
-                # 玩家自动瞄准也用相同逻辑
-                enemy_angle = math.atan2(-dy, dx) % (2*math.pi)
-                d_angle = enemy_angle - self.player.aim_angle
-                d_angle = np.clip(d_angle, -deg2rad(3), deg2rad(3))
 
         self.player.move(dx, dy, self.walls)
         self.player.rotate_gun(d_angle)
@@ -285,24 +278,20 @@ class TankGame:
             if not enemy.alive or self.game_over: continue
             
             # ========== 核心修复：瞄准角度计算 ==========
-            # 计算敌方到玩家的向量（dx: x轴差值, dy: y轴差值）
-            dx = self.player.x - enemy.x  # 敌方x → 玩家x
-            dy = self.player.y - enemy.y  # 敌方y → 玩家y
-            # 适配pygame坐标系的瞄准角度：math.atan2(-dy, dx)
-            # 该计算和子弹发射/炮管绘制的cos/sin计算完全匹配，保证朝向绝对正确
+            dx = self.player.x - enemy.x
+            dy = self.player.y - enemy.y
             target_angle = math.atan2(-dy, dx) % (2 * math.pi)
-            enemy.aim_angle = target_angle  # 炮管直接锁定玩家，无偏移
+            enemy.aim_angle = target_angle
 
-            # 敌方随机移动（保留原有逻辑）
+            # 敌方随机移动
             if random.random() < 0.3:
-                enemy.move(random.choice([-8,0,8]), random.choice([-8,0,8]), self.walls)
+                enemy.move(random.choice([-1,0,1]), random.choice([-1,0,1]), self.walls)
 
-            # 敌方射击：限制3颗子弹，射击时轻微散布（保留原有逻辑）
+            # 敌方射击：限制子弹数量，轻微散布
             current_enemy_bullets = len([b for b in self.bullets if not b.is_player_bullet])
-            if current_enemy_bullets < ENEMY_MAX_BULLETS and random.random() < 1:
+            if current_enemy_bullets < ENEMY_MAX_BULLETS and random.random() < 0.05:
                 bullet = enemy.shoot()
                 if bullet:
-                    # 仅在射击时添加轻微角度散布，不影响炮管瞄准
                     bullet.angle += random.uniform(-ENEMY_BULLET_ANGLE_OFFSET, ENEMY_BULLET_ANGLE_OFFSET)
                     self.bullets.append(bullet)
             enemy.update_cooldown()
@@ -324,7 +313,7 @@ class TankGame:
                         enemy.lives -= 1
                         if enemy.lives <= 0:
                             enemy.alive = False
-                            self.score += 20
+                            self.score += 70  # 适配AI击杀奖励判定（70分=击杀）
                         hit = True
                         break
             else:
@@ -338,47 +327,51 @@ class TankGame:
                 new_bullets.append(bullet)
         self.bullets = new_bullets
         
-        self.enemies = [e for e in self.enemies if e.alive]
-        if len(self.enemies) < 3 and random.random() < 0.01 and not self.game_over:
+        # 补充敌方坦克
+        enemies_alive = [e for e in self.enemies if e.alive]
+        if len(enemies_alive) < 3 and random.random() < 0.01 and not self.game_over:
             self.enemies.append(Tank(random.randint(100,700), random.randint(100,200), BLUE))
 
     def _update_timer(self):
         """新增：更新游戏计时，时间到则清零玩家生命值并结束游戏"""
         if self.game_over or self.remaining_time <= 0:
             return
-        # 累计总帧数，每60帧=1秒（FPS固定60）
         self.total_frames += 1
         if self.total_frames % FPS == 0:
             self.remaining_time -= 1
-            # 时间到：清零玩家生命值，标记游戏结束
             if self.remaining_time <= 0:
                 self.player.lives = 0
                 self.player.alive = False
                 self.game_over = True
 
     def step(self):
-        """游戏内部：单步更新游戏逻辑（AI调用后，更新游戏状态）"""
+        """游戏内部：单步更新游戏逻辑（AI调用后，更新游戏状态），返回(reward, done)"""
         if self.game_over: return 0, True
-        # 新增：先更新计时
         self._update_timer()
         self.step_count += 1
         self.player.update_cooldown()
         self._update_enemies()
         self._update_bullets()
-        self._render()
+        self.render()  # 调用公开的render方法
+        # 计算基础奖励
         reward = 0
         reward += self.score - self.last_score
         if self.player.lives < self.last_lives:
             reward -= 10
             self.last_lives = self.player.lives
         self.last_score = self.score
-        # 游戏结束条件：玩家死亡/步数超限/分数达标/时间耗尽
-        done = self.game_over or self.step_count >= self.max_steps or self.score >= 500
+        # 游戏结束条件
+        done = self.game_over or self.step_count >= self.max_steps or self.score >= 1000
         return reward, done
+
+    # 修复点2：定义公开的render方法，供AI代码调用，内部调用私有渲染逻辑
+    def render(self):
+        """AI公开调用接口：画面渲染，解决bool不可调用核心错误"""
+        self._render()
 
     def _draw_game_over(self):
         """绘制游戏结束界面+重新开始按钮（新增时间耗尽提示）"""
-        if not self.render: return
+        if not self.is_render: return
         mask = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
         mask.fill((0, 0, 0, 200))
         self.screen.blit(mask, (0, 0))
@@ -403,24 +396,26 @@ class TankGame:
         self.screen.blit(score_text, score_rect)
 
     def _render(self):
-        """游戏内部：画面渲染（含游戏结束界面+新增时间显示）"""
-        if not self.render or not self.screen: return
+        """游戏内部私有渲染逻辑，所有渲染判断用重命名后的is_render"""
+        if not self.is_render or not self.screen: return
         self.screen.fill(BLACK)
         if not self.game_over:
+            # 绘制墙体
             for wall in self.walls:
                 pygame.draw.rect(self.screen, GRAY, (wall[0], wall[1], WALL_SIZE, WALL_SIZE))
                 pygame.draw.rect(self.screen, BLACK, (wall[0], wall[1], WALL_SIZE, WALL_SIZE), 1)
+            # 绘制坦克和子弹
             self.player.draw(self.screen)
             for enemy in self.enemies:
                 enemy.draw(self.screen)
             for bullet in self.bullets:
                 bullet.draw(self.screen)
-            # 绘制信息栏（新增时间显示）
+            # 绘制信息栏
             self.screen.blit(self.small_font.render(f"Score: {self.score}", True, WHITE), (10,10))
             self.screen.blit(self.small_font.render(f"Lives: {self.player.lives}", True, RED), (SCREEN_WIDTH-120,10))
             enemy_bullet_num = len([b for b in self.bullets if not b.is_player_bullet])
             self.screen.blit(self.small_font.render(f"Enemy Bullets: {enemy_bullet_num}/{ENEMY_MAX_BULLETS}", True, YELLOW), (200,10))
-            # 新增：绘制剩余时间，剩余10秒内显示警示红色
+            # 绘制剩余时间（警示色）
             time_color = RED_ALERT if self.remaining_time <= 10 else WHITE
             self.screen.blit(self.small_font.render(f"Time: {self.remaining_time}s", True, time_color), (450,10))
         else:
