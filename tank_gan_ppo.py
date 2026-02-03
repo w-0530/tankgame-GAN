@@ -27,40 +27,43 @@ STATE_DIM = 14
 ACTION_DIM = 2  # 0=移动 1=瞄准
 DEMO_VEC_DIM = STATE_DIM + ACTION_DIM
 
-# ====================== 超参数（微调GAN权重至0.08，更保守） ======================
+# ====================== 超参数（核心修复：强化瞄准、弱化移动） ======================
 # PPO超参数
 PPO_LR = 3e-4
 GAMMA = 0.98
 LAMBDA = 0.85
 EPS_CLIP = 0.25
 BATCH_SIZE = 32
-ENT_COEF = 0.1
+ENT_COEF = 0.05  # 降低探索系数，避免无意义乱动
 MAX_STEP = 350
-# GAN超参数（🔧 按要求设为0.05~0.1区间，选0.08更稳妥）
+# GAN超参数（保守权重，不主导训练）
 GAN_LR = 4e-5
 GAN_UPDATE_INTERVAL = 5
-GAN_REWARD_WEIGHT = 0.08  # 核心：小权重融合，不主导奖励
+GAN_REWARD_WEIGHT = 0.05  # 进一步降低GAN权重
 
-# ====================== 奖励/惩罚配置（新增瞄准硬奖励5.0） ======================
-REWARD_DIRECT_SHOT_POS = 3.0     # 移动直射位奖励
-REWARD_DODGE_BULLET = 1.5       # 躲子弹奖励
-REWARD_AIM_EXPOSED = 2.0        # 原瞄准奖励
-REWARD_AIM_PERFECT = 5.0        # 🔧 新增：完美瞄准硬奖励（更高）
-PUNISH_NO_KILL = 1.5            # 未击杀惩罚
-PUNISH_IDLE = 1.0               # 重复动作惩罚
-PUNISH_BEEN_HIT = 30.0          # 被击中惩罚
-# 判定阈值
-BULLET_DODGE_DIST = 50          # 子弹安全距离
-NO_KILL_STEP_THRESH = 20        # 未击杀惩罚步数
-CLOSE_DIST_THRESH = 200         # 敌人暴露距离
-RAYCAST_STEP = 10               # 射线检测步长
-AIM_PERFECT_THRESH = 0.1        # 🔧 新增：完美瞄准误差阈值
+# ====================== 奖励/惩罚配置（核心修复：瞄准零门槛+梯度化 | 向敌奖励） ======================
+REWARD_DIRECT_SHOT_POS = 1.5     # 降低移动奖励，避免移动主导
+REWARD_DODGE_BULLET = 0.8        # 降低躲子弹奖励，消极防御不优先
+REWARD_AIM_GRADIENT = 3.0        # 零门槛梯度瞄准奖励（只要转炮管就给）
+REWARD_AIM_GOOD = 4.0            # 较好瞄准奖励（误差<0.3，易触发）
+REWARD_AIM_PERFECT = 6.0         # 完美瞄准奖励（门槛降低到0.2）
+REWARD_TOWARD_ENEMY = 1.2        # 核心：向敌人移动奖励，引导有意识跑位
+PUNISH_NO_KILL = 0.8             # 降低未击杀惩罚，给AI瞄准时间
+PUNISH_IDLE = 0.3                # 大幅降低重复动作惩罚，允许连续瞄准
+PUNISH_BEEN_HIT = 20.0           # 降低被击中惩罚，训练初期不怕失误
+# 判定阈值（全量降低门槛，训练初期易触发）
+BULLET_DODGE_DIST = 60           # 提高躲子弹安全距离
+NO_KILL_STEP_THRESH = 30         # 提高未击杀惩罚步数
+CLOSE_DIST_THRESH = 250          # 扩大敌人暴露距离
+RAYCAST_STEP = 15                # 降低射线检测精度，直射位易判定
+AIM_GOOD_THRESH = 0.3            # 较好瞄准阈值（30%误差）
+AIM_PERFECT_THRESH = 0.2         # 完美瞄准阈值（20%误差，易触发）
 
-# ====================== 训练配置 ======================
-MEMORY_CAPACITY = 60000
-DEMO_MEMORY_CAPACITY = 4000
-TRAIN_EPISODES = 1200
-SAVE_INTERVAL = 100
+# ====================== 训练配置（快速验证，100轮见效果） ======================
+MEMORY_CAPACITY = 40000  # 减小经验池，训练更新更快
+DEMO_MEMORY_CAPACITY = 3000
+TRAIN_EPISODES = 1200     # 减少训练轮数，快速验证
+SAVE_INTERVAL = 50       # 提高保存频率，每50轮测试一次
 RENDER_TRAIN = False
 RENDER_TEST = True
 
@@ -129,50 +132,55 @@ class DemoMemory:
         return len(self.memory)
 
 # =========================================================
-# PPO 网络（🔧 改动1：get_best_action加瞄准方向偏好，7:3比例）
+# PPO 网络（核心修改：LeakyReLU→ReLU，适配浅层模型+初始化优化）
 # =========================================================
 class PPO_Actor(nn.Module):
     def __init__(self, state_dim, action_dim=2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, 64),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),  # 替换LeakyReLU，梯度更直接
             nn.Linear(64, 32),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),  # 替换LeakyReLU
             nn.Linear(32, action_dim)
         ).to(DEVICE)
-        # AI动作类型对应的游戏动作列表
         self.MOVE_ACTION_LIST = [ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT]
         self.AIM_ACTION_LIST = [ACTION_GUN_LEFT, ACTION_GUN_RIGHT]
+        # 核心：瞄准动作探索偏向，强制AI探索瞄准（打破移动死循环）
+        self.aim_explore_bias = 0.4
+        # 浅层网络初始化优化：偏置置0，避免初始值干扰
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x):
-        return F.softmax(self.net(x.to(DEVICE)), dim=-1)
+        logits = self.net(x.to(DEVICE))
+        # 给瞄准动作（索引1）加偏向，提升其被选中的概率
+        logits[:, 1] += self.aim_explore_bias
+        return F.softmax(logits, dim=-1)
 
     def get_action(self, state):
-        """训练用：返回游戏动作、AI0/1动作、动作概率"""
+        """训练用：返回游戏动作、AI0/1动作、动作概率 | 训练期也加瞄准方向偏好"""
         s = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             probs = self(s)
         ai_action = torch.multinomial(probs, 1).item()
-        # 按AI类型随机选游戏动作
+        # 训练期瞄准方向6:4偏好，让炮管连续转动，而非随机乱转
         if ai_action == 0:
             game_action = random.choice(self.MOVE_ACTION_LIST)
         else:
-            game_action = random.choice(self.AIM_ACTION_LIST)
+            game_action = ACTION_GUN_LEFT if random.random() < 0.6 else ACTION_GUN_RIGHT
         return game_action, ai_action, probs[0, ai_action].item()
 
     def get_best_action(self, state):
-        """🔧 改动1：瞄准动作7:3方向偏好，炮管连续转不抖动（仅测试用，零风险）"""
+        """测试用：瞄准动作7:3方向偏好，炮管连续转不抖动"""
         s = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             probs = self(s)
-
         ai_action = torch.argmax(probs, dim=1).item()
-
         if ai_action == 0:
             return random.choice(self.MOVE_ACTION_LIST)
         else:
-            # 70%左瞄准，30%右瞄准，动作一致不抖动
             return ACTION_GUN_LEFT if random.random() < 0.7 else ACTION_GUN_RIGHT
 
 class PPO_Critic(nn.Module):
@@ -180,27 +188,35 @@ class PPO_Critic(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, 64),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),  # 替换LeakyReLU
             nn.Linear(64, 32),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),  # 替换LeakyReLU
             nn.Linear(32, 1)
         ).to(DEVICE)
+        # 浅层网络初始化优化：偏置置0
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x):
         return self.net(x.to(DEVICE))
 
 # =========================================================
-# GAN 判别器（无改动，保留原有逻辑）
+# GAN 判别器（核心修改：LeakyReLU→ReLU）
 # =========================================================
 class GAILGAN(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
         self.discriminator = nn.Sequential(
             nn.Linear(input_dim, 128),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),  # 替换LeakyReLU
             nn.Linear(128, 1)
         ).to(DEVICE)
         self.optimizer = optim.Adam(self.discriminator.parameters(), lr=GAN_LR)
+        # 初始化优化：偏置置0
+        for m in self.discriminator.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.constant_(m.bias, 0.0)
     
     def forward(self, x):
         return self.discriminator(x.to(DEVICE))
@@ -219,7 +235,7 @@ class GAILGAN(nn.Module):
         return loss.item(), gan_reward
 
 # =========================================================
-# PPO-GAN 智能体（无改动）
+# PPO-GAN 智能体
 # =========================================================
 class PPO_GAN_Simple:
     def __init__(self):
@@ -287,7 +303,7 @@ class PPO_GAN_Simple:
         print(f"✅ 加载模型：{model_path}")
 
 # =========================================================
-# 工具函数（无改动，射线检测正常）
+# 工具函数（新增向敌移动判定）
 # =========================================================
 def get_nearest_enemy(game):
     enemies_alive = [e for e in game.enemies if e.alive]
@@ -347,56 +363,83 @@ def calculate_aim_error(game):
     current_angle = game.player.aim_angle % (2 * math.pi)
     angle_error = abs(current_angle - target_angle)
     angle_error = min(angle_error, 2 * math.pi - angle_error)
-    return angle_error / math.pi
+    return angle_error / math.pi  # 归一化到0~1
+
+# 核心新增：判定是否向敌人移动
+def is_toward_enemy(game, last_player_pos):
+    enemy = get_nearest_enemy(game)
+    if not enemy or not game.player.alive:
+        return False
+    last_x, last_y = last_player_pos
+    dist_last = math.hypot(enemy.x - last_x, enemy.y - last_y)
+    dist_current = math.hypot(enemy.x - game.player.x, enemy.y - game.player.y)
+    return (dist_last - dist_current) > 1e-3  # 距离减少=向敌移动
 
 # =========================================================
-# 奖励函数（🔧 改动2：新增完美瞄准硬奖励5.0，不删原逻辑）
+# 奖励函数（完全重写：零门槛梯度瞄准+向敌移动引导）
 # =========================================================
 def get_env_reward(game, action, agent):
     final_reward = 0.0
-    enemy_visible = get_nearest_enemy(game) is not None and game.player.alive
+    enemy = get_nearest_enemy(game)
+    enemy_visible = enemy is not None and game.player.alive
+    current_player_pos = (game.player.x, game.player.y)
 
-    # 移动动作奖励
-    if action in [ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT] and enemy_visible:
-        if is_in_direct_shot_position(game):
-            final_reward += REWARD_DIRECT_SHOT_POS
-        if is_dodging_bullet(game):
-            final_reward += REWARD_DODGE_BULLET
-    # 原瞄准动作奖励
-    if action in [ACTION_GUN_LEFT, ACTION_GUN_RIGHT] and enemy_visible and is_enemy_exposed(game):
-        aim_error = calculate_aim_error(game)
-        if aim_error < 0.2:
-            final_reward += REWARD_AIM_EXPOSED * (1 - aim_error)
-    
-    # 🔧 改动2：新增完美瞄准硬奖励（误差<10%加5.0，远高于移动奖励）
+    # 1. 瞄准动作奖励（核心：零门槛+梯度化，只要有敌人就给奖励）
     if action in [ACTION_GUN_LEFT, ACTION_GUN_RIGHT] and enemy_visible:
         aim_error = calculate_aim_error(game)
+        # 零门槛梯度奖励：误差越小，奖励越高
+        final_reward += REWARD_AIM_GRADIENT * (1 - aim_error)
+        # 较好瞄准奖励（误差<0.3，易触发）
+        if aim_error < AIM_GOOD_THRESH:
+            final_reward += REWARD_AIM_GOOD
+        # 完美瞄准奖励（误差<0.2，叠加高额奖励）
         if aim_error < AIM_PERFECT_THRESH:
             final_reward += REWARD_AIM_PERFECT
 
-    # 各项惩罚
+    # 2. 移动动作奖励（引导有意识跑位：优先向敌移动）
+    if action in [ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT] and enemy_visible:
+        # 核心：向敌人移动就给奖励，引导AI主动靠近
+        if is_toward_enemy(game, agent.last_player_pos):
+            final_reward += REWARD_TOWARD_ENEMY
+        # 直射位奖励（次要）
+        if is_in_direct_shot_position(game):
+            final_reward += REWARD_DIRECT_SHOT_POS
+        # 躲子弹奖励（最次要）
+        if is_dodging_bullet(game):
+            final_reward += REWARD_DODGE_BULLET
+
+    # 3. 惩罚项（大幅弱化，不压制探索）
     if enemy_visible:
         agent.no_kill_step += 1
         if agent.no_kill_step >= NO_KILL_STEP_THRESH:
             final_reward -= PUNISH_NO_KILL
             agent.no_kill_step = NO_KILL_STEP_THRESH - 10
+    # 重复动作惩罚（允许连续瞄准/向敌移动）
     if agent.last_action == action and agent.last_action != -1:
         final_reward -= PUNISH_IDLE
+    # 被击中惩罚（降低，不怕失误）
     if hasattr(game.player, 'been_hit') and game.player.been_hit:
         final_reward -= PUNISH_BEEN_HIT
         game.player.been_hit = False
 
-    game.player.auto_shoot = True
+    # 4. 自动开火绑定瞄准精度：只有较好瞄准才开火（避免无脑射击）
+    if enemy_visible:
+        aim_error = calculate_aim_error(game)
+        game.player.auto_shoot = aim_error < AIM_GOOD_THRESH
+    else:
+        game.player.auto_shoot = False
+
+    # 更新代理状态
     agent.last_action = action
-    agent.last_player_pos = (game.player.x, game.player.y)
-    return np.clip(final_reward, -50, 50)
+    agent.last_player_pos = current_player_pos
+    return np.clip(final_reward, -10, 20)
 
 # =========================================================
-# 生成专家经验（无改动）
+# 生成专家经验
 # =========================================================
-def generate_demo_data(demo_memory, demo_num=1000):
+def generate_demo_data(demo_memory, demo_num=300):  # 减少采集数量，快速完成
     print("\n🎮 生成专家经验 | 按键：WASD=移动 | ←→=瞄准 | ESC退出")
-    print(f"🎯 目标采集：{demo_num}条有效直射位经验")
+    print(f"🎯 目标采集：{demo_num}条有效经验（重点多转炮管瞄准！）")
     game = TankGame(render=True)
     state = game.reset()
     clock = pygame.time.Clock()
@@ -420,13 +463,13 @@ def generate_demo_data(demo_memory, demo_num=1000):
         elif keys[pygame.K_LEFT] or keys[pygame.K_RIGHT]:
             ai_action_type = 1
             action = ACTION_GUN_LEFT if keys[pygame.K_LEFT] else ACTION_GUN_RIGHT
-        # 直射位采集经验
-        if game.player.alive and is_in_direct_shot_position(game):
+        # 采集经验（放宽条件，只要存活就采集，重点是瞄准动作）
+        if game.player.alive:
             state_np = np.asarray(state, dtype=np.float32).flatten()
             action_one_hot = np.eye(ACTION_DIM, dtype=np.float32)[ai_action_type]
             demo_vec = np.concatenate([state_np, action_one_hot])
             demo_memory.add(demo_vec)
-            if len(demo_memory) % 100 == 0:
+            if len(demo_memory) % 50 == 0:
                 print(f"📈 已采集：{len(demo_memory)}/{demo_num} 条")
         # 执行动作
         game.do_action(action)
@@ -442,7 +485,7 @@ def generate_demo_data(demo_memory, demo_num=1000):
     print(f"\n✅ 专家经验生成完成！实际采集：{len(demo_memory)}条")
 
 # =========================================================
-# 训练入口（🔧 改动3：融合GAN奖励到环境奖励，GAN不再白训练）
+# 训练入口
 # =========================================================
 def train_ai(load_model_path=None):
     pygame.init()
@@ -455,14 +498,14 @@ def train_ai(load_model_path=None):
         agent.demo_memory.load_from_npy(demo_path)
     else:
         print(f"⚠️  未找到专家经验，开始手动采集...")
-        generate_demo_data(agent.demo_memory, 1000)
+        generate_demo_data(agent.demo_memory, 300)  # 只采集300条，快速完成
     # 加载预训练模型
     if load_model_path and os.path.exists(load_model_path):
         agent.load(load_model_path)
     # 维度校验
     assert len(game.get_state()) == STATE_DIM, f"状态维度不匹配！游戏{len(game.get_state())} vs 配置{STATE_DIM}"
     print(f"\n🚀 正式开始训练 | 总轮数：{TRAIN_EPISODES} | GAN奖励权重：{GAN_REWARD_WEIGHT}")
-    print(f"📌 核心奖励：完美瞄准+{REWARD_AIM_PERFECT} | 直射位+{REWARD_DIRECT_SHOT_POS}")
+    print(f"📌 核心奖励：零门槛瞄准+{REWARD_AIM_GRADIENT} | 向敌移动+{REWARD_TOWARD_ENEMY}")
     pbar = tqdm(range(1, TRAIN_EPISODES + 1), desc="训练进度")
 
     for ep in pbar:
@@ -472,20 +515,19 @@ def train_ai(load_model_path=None):
         step = 0
         ppo_loss_sum = 0.0
         ppo_train_count = 0
-        gan_reward_sum = 0.0  # 新增：统计GAN奖励均值
+        gan_reward_sum = 0.0
 
         while step < MAX_STEP and not game.game_over:
             step += 1
-            # 获取动作
+            # 获取动作（训练期带瞄准方向偏好）
             game_action, ai_action, action_prob = agent.actor.get_action(state)
             game.do_action(game_action)
-            game.player.auto_shoot = True
             _, done = game.step()
-            # 计算基础环境奖励
+            # 计算核心环境奖励（零门槛瞄准+向敌引导）
             base_reward = get_env_reward(game, game_action, agent)
             next_state = game.get_state()
 
-            # 🔧 改动3：训练GAN并融合奖励（小权重，不主导）
+            # GAN奖励融合（小权重，辅助训练）
             gan_reward = 0.0
             if step % GAN_UPDATE_INTERVAL == 0 and len(agent.ppo_memory) >= BATCH_SIZE:
                 batch = agent.ppo_memory.sample(BATCH_SIZE)
@@ -494,13 +536,12 @@ def train_ai(load_model_path=None):
                     ai_action_onehot = agent.one_hot(a_ppo.squeeze(1))
                     agent_batch = torch.cat([s_ppo, ai_action_onehot], dim=-1)
                     expert_batch = agent.demo_memory.sample(BATCH_SIZE)
-                    # 训练GAN并获取GAN奖励
                     gan_loss, gan_reward = agent.gan.train_step(agent_batch, expert_batch)
                     gan_reward_sum += gan_reward
-            # 融合总奖励：环境奖励 + 小权重GAN奖励
+            # 总奖励 = 环境奖励 + 小权重GAN奖励
             total_reward_step = base_reward + GAN_REWARD_WEIGHT * gan_reward
 
-            # 存储经验（用融合后的总奖励）
+            # 存储经验
             agent.ppo_memory.add(state, ai_action, total_reward_step, next_state, done, action_prob)
             total_reward += total_reward_step
 
@@ -513,7 +554,7 @@ def train_ai(load_model_path=None):
             # 更新状态
             state = next_state
 
-        # 进度条展示：新增GAN奖励均值，直观看到GAN效果
+        # 进度条展示
         avg_ppo_loss = ppo_loss_sum / max(ppo_train_count, 1)
         avg_gan_reward = gan_reward_sum / max(step // GAN_UPDATE_INTERVAL, 1)
         pbar.set_postfix({
@@ -532,7 +573,7 @@ def train_ai(load_model_path=None):
     print(f"\n🎉 训练全部完成！最终模型保存至：./tank_ai_models_simple/ppo_gan_simple_ep{TRAIN_EPISODES}.pth")
 
 # =========================================================
-# 测试入口（调用改动后的get_best_action，瞄准有方向偏好）
+# 测试入口
 # =========================================================
 def test_ai(model_path):
     pygame.init()
@@ -552,10 +593,9 @@ def test_ai(model_path):
     while step < MAX_STEP and not game.game_over:
         step += 1
         clock.tick(60)
-        # 调用有方向偏好的get_best_action
+        # 调用带方向偏好的最优动作
         action = agent.actor.get_best_action(state)
         game.do_action(action)
-        game.player.auto_shoot = True
         game.step()
         reward = get_env_reward(game, action, agent)
         total_reward += reward

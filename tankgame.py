@@ -5,7 +5,7 @@ import numpy as np
 
 # ====================== 游戏常量（可独立修改，不影响AI） =======================
 pygame.init()
-SCREEN_WIDTH = 800
+SCREEN_WIDTH = 1200
 SCREEN_HEIGHT = 600
 FPS = 60
 TANK_SIZE = 40
