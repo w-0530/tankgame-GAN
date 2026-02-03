@@ -126,6 +126,8 @@ class Tank:
         self.cooldown_max = 25 if is_player else 40
         self.aim_angle = 0.0  # 角度完全适配pygame子弹发射逻辑
         self.alive = True
+        # ============== 核心修改1：新增AI自动开火标记 ==============
+        self.auto_shoot = False  # AI控制时生效，手动游玩不影响
 
     def draw(self, screen):
         if not self.alive: return
@@ -350,6 +352,13 @@ class TankGame:
         self._update_timer()
         self.step_count += 1
         self.player.update_cooldown()
+        
+        # ============== 核心修改2：AI自动开火逻辑（仅AI控制时生效） ==============
+        if self.player.auto_shoot and self.player.alive:
+            bullet = self.player.shoot()
+            if bullet:
+                self.bullets.append(bullet)
+        
         self._update_enemies()
         self._update_bullets()
         self.render()  # 调用公开的render方法
