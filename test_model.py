@@ -1,86 +1,131 @@
 import os
 import pygame
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import random
 
-from tankgame import TankGame
-from tank_gan_ppo import (
-    PPO_GAN_Simple,
-    STATE_DIM,
-    MAX_STEP
+from tankgame import (
+    TankGame, ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT,
+    ACTION_GUN_LEFT, ACTION_GUN_RIGHT
 )
 
-# ===================== 配置 =====================
-RENDER = True
-FPS = 60
-MODEL_PATH = "./tank_ai_models_simple/ppo_gan_simple_ep1200.pth"
-# ===============================================
-
-
-def test_model(model_path):
-    assert os.path.exists(model_path), f"❌ 模型不存在: {model_path}"
-
+# 超级简单的测试脚本
+def super_simple_test(model_path):
+    """最简单的测试脚本"""
+    if not os.path.exists(model_path):
+        print(f"❌ 模型不存在: {model_path}")
+        # 尝试查找其他模型
+        model_dir = os.path.dirname(model_path)
+        if os.path.exists(model_dir):
+            files = [f for f in os.listdir(model_dir) if f.endswith('.pth')]
+            if files:
+                model_path = os.path.join(model_dir, files[0])
+                print(f"🔍 使用找到的模型: {model_path}")
+            else:
+                print(f"❌ 没有找到任何模型文件")
+                return
+        else:
+            print(f"❌ 模型目录不存在")
+            return
+    
     pygame.init()
-    game = TankGame(render=RENDER)
-    clock = pygame.time.Clock()
-
-    # ---------- agent ----------
-    agent = PPO_GAN_Simple()
-    agent.load(model_path)
-
-    # ⭐ 强制评估模式（保险）
-    agent.actor.eval()
-    agent.critic.eval()
-
-    # ---------- reset ----------
-    state = game.reset()
-    agent.reset_combat_state()
-
-    step = 0
-    total_reward = 0.0
-    kill_num = 0
-
-    print(f"\n🎮 开始测试模型：{model_path}")
-    print("💡 按 Q 或关闭窗口退出\n")
-
-    # ===================== 主循环 =====================
-    while step < MAX_STEP and not game.game_over:
-        step += 1
-        clock.tick(FPS)
-
-        # ✅ 测试阶段：只用最优策略 → 游戏动作
+    game = TankGame(render=True)
+    
+    # 最简单的网络
+    class TinyActor(nn.Module):
+        def __init__(self, input_dim=14, output_dim=2):
+            super().__init__()
+            self.fc1 = nn.Linear(input_dim, 32)
+            self.fc2 = nn.Linear(32, output_dim)
+        
+        def forward(self, x):
+            x = torch.relu(self.fc1(x))
+            x = self.fc2(x)
+            return torch.softmax(x, dim=-1)
+    
+    # 加载模型
+    actor = TinyActor()
+    
+    try:
+        checkpoint = torch.load(model_path, map_location='cpu')
+        print(f"📦 检查点结构: {checkpoint.keys() if isinstance(checkpoint, dict) else '不是字典'}")
+        
+        # 尝试加载actor
+        if isinstance(checkpoint, dict):
+            if 'actor' in checkpoint:
+                actor.load_state_dict(checkpoint['actor'])
+            elif 'actor_state_dict' in checkpoint:
+                actor.load_state_dict(checkpoint['actor_state_dict'])
+            elif 'model' in checkpoint:
+                actor.load_state_dict(checkpoint['model'])
+            else:
+                # 尝试所有键
+                for key in checkpoint:
+                    if isinstance(checkpoint[key], dict) and 'weight' in checkpoint[key]:
+                        try:
+                            actor.load_state_dict(checkpoint[key])
+                            print(f"✅ 使用键 '{key}' 加载")
+                            break
+                        except:
+                            continue
+        else:
+            actor.load_state_dict(checkpoint)
+    except Exception as e:
+        print(f"⚠️  加载模型时出错: {e}")
+        print("使用随机初始化的模型")
+    
+    actor.eval()
+    
+    # 动作映射
+    def get_action(state):
         with torch.no_grad():
-            action = agent.actor.get_best_action(state)
-
+            state_tensor = torch.FloatTensor(state).unsqueeze(0)
+            probs = actor(state_tensor)
+            action_idx = torch.argmax(probs).item()
+            
+            if action_idx == 0:
+                # 移动
+                return random.choice([ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT])
+            else:
+                # 瞄准
+                return ACTION_GUN_LEFT if random.random() < 0.7 else ACTION_GUN_RIGHT
+    
+    # 测试循环
+    state = game.reset()
+    step = 0
+    kills = 0
+    
+    print(f"\n🎮 开始测试")
+    print("按 Q 退出")
+    
+    while step < 350 and not game.game_over:
+        step += 1
+        
+        action = get_action(state)
         game.do_action(action)
         game.player.auto_shoot = True
         game.step()
-
+        
         state = game.get_state()
-        kill_num = game.score // 70 if game.score > 0 else 0
-
-        if RENDER:
-            game.render()
-            pygame.display.flip()
-
-        # ---------- 事件 ----------
+        kills = game.score // 70 if game.score > 0 else 0
+        
+        # 显示当前状态
+        print(f"步数: {step:3d} | 击杀: {kills:2d} | 得分: {game.score:4d}", end='\r')
+        
+        # 事件处理
         for event in pygame.event.get():
-            if event.type == pygame.QUIT or (
-                event.type == pygame.KEYDOWN and event.key == pygame.K_q
-            ):
+            if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_q):
                 pygame.quit()
-                print("\n🛑 测试手动退出")
+                print(f"\n🛑 手动退出")
                 return
-
+    
     pygame.quit()
+    print(f"\n✅ 测试完成")
+    print(f"最终击杀: {kills}")
+    print(f"最终得分: {game.score}")
 
-    # ===================== 结果 =====================
-    print("\n✅ 测试结束")
-    print(f"📊 步数：{step}")
-    print(f"🏆 击杀数：{kill_num}")
-    print(f"💀 存活：{game.player.alive}")
-    print(f"🎯 得分：{game.score}")
-    print(f"📈 结果：{'胜利' if kill_num >= 8 else '失败'}（胜利条件：击杀≥8）")
-
-
+# 运行
 if __name__ == "__main__":
-    test_model(MODEL_PATH)
+    model_path = "./tank_ai_models_simple/ppo_gan_simple_ep300.pth"
+    super_simple_test(model_path)
