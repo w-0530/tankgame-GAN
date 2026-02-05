@@ -1,9 +1,3 @@
-# tankgame_working_train_fixed.py
-"""
-🚀 坦克游戏AI - 真正有效的工作训练脚本（修复版）
-基于诊断结果：规则AI能工作，所以神经网络应该也能学习
-修复了Pygame字体初始化问题
-"""
 
 import pygame
 import torch
@@ -24,7 +18,6 @@ pygame.font.init()
 from tankgame import TankGame, ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT, ACTION_GUN_LEFT, ACTION_GUN_RIGHT
 
 # ============ 修复：正确的动作映射 ============
-# 根据tankgame.py中的实际常量
 ACTION_MAP = {
     0: None,              # 无动作
     1: ACTION_UP,         # 上
@@ -38,11 +31,13 @@ ACTION_MAP = {
 # 反向映射：游戏动作 -> 网络动作索引
 GAME_ACTION_TO_IDX = {v: k for k, v in ACTION_MAP.items() if v is not None}
 
-# ============ 超参数 ============
-STATE_DIM = 14
+# ============ 修复：根据诊断结果设置正确的状态维度 ============
+STATE_DIM = 12  # 修正：诊断结果显示状态维度是12
 ACTION_DIM = 7  # 0-6，但0是无动作
 
-# 训练参数
+print(f"✅ 使用正确的状态维度: {STATE_DIM}")
+
+# ============ 训练参数 ============
 LEARNING_RATE = 0.001
 GAMMA = 0.99
 BATCH_SIZE = 64
@@ -68,12 +63,14 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-# ============ 聪明的神经网络 ============
+# ============ 修复的神经网络（输入维度12） ============
 class SmartAIModel(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
         
-        # 使用更深的网络
+        print(f"🛠️ 创建神经网络: 输入={state_dim}, 输出={action_dim}")
+        
+        # 根据12维输入调整网络结构
         self.net = nn.Sequential(
             nn.Linear(state_dim, 128),
             nn.ReLU(),
@@ -84,33 +81,29 @@ class SmartAIModel(nn.Module):
             nn.Linear(32, action_dim)
         )
         
-        # 初始化偏向瞄准动作（5,6）
+        # 初始化权重
         self._initialize_weights()
     
     def _initialize_weights(self):
-        """初始化权重，偏向瞄准动作"""
+        """初始化权重"""
         for layer in self.net:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
-        
-        # 最后层偏向炮管转动
-        with torch.no_grad():
-            last_layer = self.net[-1]
-            last_layer.weight[5] += 0.5  # 炮左转
-            last_layer.weight[6] += 0.5  # 炮右转
     
     def forward(self, x):
         return self.net(x)
 
-# ============ DQN Agent ============
+# ============ DQN Agent（修复版） ============
 class DQNAgent:
     def __init__(self, state_dim, action_dim):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # 网络
+        print(f"🤖 创建智能体: 状态维度={state_dim}, 动作维度={action_dim}, 设备={self.device}")
+        
+        # 网络（使用正确的输入维度）
         self.policy_net = SmartAIModel(state_dim, action_dim).to(self.device)
         self.target_net = SmartAIModel(state_dim, action_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -129,6 +122,9 @@ class DQNAgent:
         # 训练统计
         self.episode_rewards = []
         self.episode_kills = []
+        
+        # 调试信息
+        self.loss_history = []
     
     def select_action(self, state, game=None):
         """选择动作，带探索"""
@@ -148,11 +144,20 @@ class DQNAgent:
         else:
             # 利用：选择Q值最大的动作
             with torch.no_grad():
+                # 确保状态是正确的维度
+                if len(state) != self.state_dim:
+                    print(f"⚠️  状态维度不匹配: 期望{self.state_dim}, 实际{len(state)}")
+                    # 截断或填充状态
+                    if len(state) > self.state_dim:
+                        state = state[:self.state_dim]
+                    else:
+                        state = list(state) + [0] * (self.state_dim - len(state))
+                
                 state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
                 q_values = self.policy_net(state_tensor)
                 
                 # 增强瞄准动作的Q值（如果接近敌人）
-                if game and game.enemies:
+                if game and hasattr(game, 'enemies') and game.enemies:
                     enemy = game.enemies[0]
                     dx = enemy.x - game.player.x
                     dy = enemy.y - game.player.y
@@ -172,39 +177,62 @@ class DQNAgent:
     def optimize_model(self):
         """优化模型"""
         if len(self.memory) < BATCH_SIZE:
-            return
+            return None
         
-        # 采样
-        states, actions, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
-        
-        # 转为tensor
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.LongTensor(actions).unsqueeze(1).to(self.device)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
-        
-        # 计算当前Q值
-        current_q = self.policy_net(states).gather(1, actions)
-        
-        # 计算目标Q值
-        with torch.no_grad():
-            next_q = self.target_net(next_states).max(1, keepdim=True)[0]
-            target_q = rewards + (1 - dones) * GAMMA * next_q
-        
-        # 计算损失
-        loss = nn.MSELoss()(current_q, target_q)
-        
-        # 优化
-        self.optimizer.zero_grad()
-        loss.backward()
-        
-        # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-        
-        self.optimizer.step()
-        
-        return loss.item()
+        try:
+            # 采样
+            states, actions, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
+            
+            # 维度检查
+            if states.shape[1] != self.state_dim:
+                print(f"🚨 严重错误: 经验池中的状态维度不匹配")
+                print(f"   期望: {self.state_dim}, 实际: {states.shape[1]}")
+                # 尝试修复
+                if states.shape[1] > self.state_dim:
+                    states = states[:, :self.state_dim]
+                    next_states = next_states[:, :self.state_dim]
+                else:
+                    padding = np.zeros((BATCH_SIZE, self.state_dim - states.shape[1]))
+                    states = np.concatenate([states, padding], axis=1)
+                    next_states = np.concatenate([next_states, padding], axis=1)
+            
+            # 转为tensor
+            states = torch.FloatTensor(states).to(self.device)
+            actions = torch.LongTensor(actions).unsqueeze(1).to(self.device)
+            rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
+            next_states = torch.FloatTensor(next_states).to(self.device)
+            dones = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
+            
+            # 计算当前Q值
+            current_q = self.policy_net(states).gather(1, actions)
+            
+            # 计算目标Q值
+            with torch.no_grad():
+                next_q = self.target_net(next_states).max(1, keepdim=True)[0]
+                target_q = rewards + (1 - dones) * GAMMA * next_q
+            
+            # 计算损失
+            loss = nn.MSELoss()(current_q, target_q)
+            
+            # 优化
+            self.optimizer.zero_grad()
+            loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+            
+            self.optimizer.step()
+            
+            # 记录损失
+            self.loss_history.append(loss.item())
+            
+            return loss.item()
+            
+        except Exception as e:
+            print(f"❌ 优化模型时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def update_target_net(self):
         """更新目标网络"""
@@ -213,25 +241,40 @@ class DQNAgent:
     def save_model(self, path):
         """保存模型"""
         torch.save({
+            'state_dim': self.state_dim,
+            'action_dim': self.action_dim,
             'policy_net_state_dict': self.policy_net.state_dict(),
             'target_net_state_dict': self.target_net.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'epsilon': self.epsilon,
             'steps_done': self.steps_done,
             'episode_rewards': self.episode_rewards,
-            'episode_kills': self.episode_kills
+            'episode_kills': self.episode_kills,
+            'loss_history': self.loss_history
         }, path)
+        print(f"💾 模型已保存到: {path}")
     
     def load_model(self, path):
         """加载模型"""
-        checkpoint = torch.load(path)
-        self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
-        self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.epsilon = checkpoint['epsilon']
-        self.steps_done = checkpoint['steps_done']
-        self.episode_rewards = checkpoint['episode_rewards']
-        self.episode_kills = checkpoint['episode_kills']
+        if not os.path.exists(path):
+            print(f"❌ 模型文件不存在: {path}")
+            return False
+            
+        try:
+            checkpoint = torch.load(path)
+            self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+            self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.epsilon = checkpoint['epsilon']
+            self.steps_done = checkpoint['steps_done']
+            self.episode_rewards = checkpoint['episode_rewards']
+            self.episode_kills = checkpoint['episode_kills']
+            self.loss_history = checkpoint.get('loss_history', [])
+            print(f"✅ 模型已加载: {path}")
+            return True
+        except Exception as e:
+            print(f"❌ 加载模型失败: {e}")
+            return False
 
 # ============ 增强的奖励函数 ============
 def calculate_reward(game, prev_score, prev_enemies_count):
@@ -243,14 +286,12 @@ def calculate_reward(game, prev_score, prev_enemies_count):
     if current_score > prev_score:
         kill_reward = 100.0  # 大幅奖励击杀
         reward += kill_reward
+        print(f"🎯 击杀奖励: +{kill_reward}")
     
-    # 2. 击中敌人奖励
-    # 这里需要根据游戏实际情况调整
-    
-    # 3. 生存奖励
+    # 2. 生存奖励
     reward += 0.1  # 每步生存奖励
     
-    # 4. 瞄准质量奖励
+    # 3. 瞄准质量奖励
     if game.enemies:
         enemy = game.enemies[0]
         dx = enemy.x - game.player.x
@@ -265,22 +306,41 @@ def calculate_reward(game, prev_score, prev_enemies_count):
         aim_reward = 0.5 * (1.0 - angle_diff / math.pi)
         reward += aim_reward
     
-    # 5. 惩罚被击中
-    # 这里需要根据游戏实际情况调整
-    
-    # 6. 惩罚无效开火
+    # 4. 惩罚无效开火
     if game.player.auto_shoot:
         reward -= 0.01  # 轻微惩罚开火消耗
     
+    # 5. 接近敌人奖励
+    if game.enemies:
+        enemy = game.enemies[0]
+        distance = math.sqrt((enemy.x - game.player.x)**2 + (enemy.y - game.player.y)**2)
+        max_distance = math.sqrt(800**2 + 600**2)  # 假设屏幕大小
+        distance_reward = 0.1 * (1.0 - distance / max_distance)
+        reward += distance_reward
+    
     return reward
 
-# ============ 训练循环 ============
+# ============ 训练循环（修复版） ============
 def train_dqn():
     print("🚀 开始DQN训练")
     print("=" * 60)
     
-    # 创建游戏和智能体
+    # 创建游戏
     game = TankGame(render=False)
+    
+    # 最终确认状态维度
+    test_state = game.get_state()
+    actual_state_dim = len(test_state)
+    print(f"✅ 最终确认状态维度: {actual_state_dim}")
+    print(f"   样本状态: {test_state[:5]}...")  # 只显示前5个值
+    
+    # 确保使用正确的状态维度
+    global STATE_DIM
+    if STATE_DIM != actual_state_dim:
+        print(f"⚠️  修正STATE_DIM: {STATE_DIM} -> {actual_state_dim}")
+        STATE_DIM = actual_state_dim
+    
+    # 创建智能体
     agent = DQNAgent(STATE_DIM, ACTION_DIM)
     
     # 训练参数
@@ -292,7 +352,8 @@ def train_dqn():
     os.makedirs("./checkpoints", exist_ok=True)
     
     # 预填充经验池
-    print("预填充经验池...")
+    print("\n📦 预填充经验池...")
+    prefill_steps = 0
     while len(agent.memory) < BATCH_SIZE * 2:
         state = game.reset()
         prev_score = game.score
@@ -332,14 +393,19 @@ def train_dqn():
             agent.memory.push(state, action, reward, next_state, done)
             
             state = next_state
+            prefill_steps += 1
             
             if done:
                 break
+            
+            if prefill_steps >= 1000:  # 防止无限循环
+                break
     
-    print(f"经验池预填充完成: {len(agent.memory)} 条经验")
+    print(f"✅ 经验池预填充完成: {len(agent.memory)} 条经验, {prefill_steps} 步")
     
     # 主训练循环
-    print("\n开始主训练循环...")
+    print("\n🎮 开始主训练循环...")
+    print("=" * 60)
     
     for episode in range(num_episodes):
         # 重置环境
@@ -390,6 +456,7 @@ def train_dqn():
             current_kills = game.score // 70 if hasattr(game, 'score') else 0
             if current_kills > episode_kills:
                 episode_kills = current_kills
+                print(f"🎯 回合{episode+1} 步{step}: 击杀! 总击杀{episode_kills}")
             
             # 存储经验
             done = game.game_over or step == 299
@@ -414,16 +481,15 @@ def train_dqn():
             agent.update_target_net()
         
         # 打印进度
-        if (episode + 1) % 50 == 0:
-            avg_reward = np.mean(agent.episode_rewards[-50:])
-            avg_kills = np.mean(agent.episode_kills[-50:])
-            kill_rate = sum(agent.episode_kills[-50:]) / 50 * 100
+        if (episode + 1) % 10 == 0:
+            avg_reward = np.mean(agent.episode_rewards[-10:]) if len(agent.episode_rewards) >= 10 else episode_reward
+            avg_kills = np.mean(agent.episode_kills[-10:]) if len(agent.episode_kills) >= 10 else episode_kills
             
             print(f"回合 {episode+1:4d} | "
-                  f"平均奖励: {avg_reward:6.1f} | "
-                  f"平均击杀: {avg_kills:4.1f} | "
-                  f"击杀率: {kill_rate:5.1f}% | "
-                  f"Epsilon: {agent.epsilon:.3f}")
+                  f"奖励: {episode_reward:6.1f} | "
+                  f"击杀: {episode_kills:2d} | "
+                  f"Epsilon: {agent.epsilon:.3f} | "
+                  f"经验池: {len(agent.memory):5d}")
         
         # 保存模型
         if (episode + 1) % save_interval == 0:
@@ -433,16 +499,58 @@ def train_dqn():
     agent.save_model("./tank_ai_final.pth")
     print("\n✅ 训练完成！模型已保存为 tank_ai_final.pth")
     
+    # 绘制训练曲线
+    if len(agent.episode_rewards) > 0:
+        try:
+            import matplotlib.pyplot as plt
+            
+            plt.figure(figsize=(12, 4))
+            
+            # 奖励曲线
+            plt.subplot(1, 3, 1)
+            plt.plot(agent.episode_rewards)
+            plt.title('Episode Rewards')
+            plt.xlabel('Episode')
+            plt.ylabel('Reward')
+            
+            # 击杀曲线
+            plt.subplot(1, 3, 2)
+            plt.plot(agent.episode_kills)
+            plt.title('Episode Kills')
+            plt.xlabel('Episode')
+            plt.ylabel('Kills')
+            
+            # 损失曲线
+            plt.subplot(1, 3, 3)
+            if agent.loss_history:
+                # 平滑损失
+                window = 50
+                smoothed_loss = []
+                for i in range(len(agent.loss_history)):
+                    start = max(0, i - window)
+                    smoothed_loss.append(np.mean(agent.loss_history[start:i+1]))
+                plt.plot(smoothed_loss)
+                plt.title('Training Loss (Smoothed)')
+                plt.xlabel('Optimization Step')
+                plt.ylabel('Loss')
+            
+            plt.tight_layout()
+            plt.savefig('./training_history.png')
+            plt.show()
+            print("📊 训练曲线已保存为 training_history.png")
+        except:
+            print("⚠️  无法绘制训练曲线（可能需要安装matplotlib）")
+    
     pygame.quit()
     return agent
 
 # ============ 测试训练好的模型 ============
 def test_trained_model(model_path=None):
-    """测试训练好的模型（修复版：确保Pygame字体初始化）"""
+    """测试训练好的模型"""
     print("\n🧪 测试AI性能")
     print("=" * 60)
     
-    # 🚨 修复：确保Pygame和字体模块已初始化
+    # 确保Pygame初始化
     try:
         pygame.init()
         pygame.font.init()
@@ -451,16 +559,23 @@ def test_trained_model(model_path=None):
     
     game = TankGame(render=True)
     
+    # 获取状态维度
+    test_state = game.get_state()
+    state_dim = len(test_state)
+    print(f"测试状态维度: {state_dim}")
+    
+    agent = DQNAgent(state_dim, ACTION_DIM)
+    
     if model_path and os.path.exists(model_path):
         print(f"加载模型: {model_path}")
-        agent = DQNAgent(STATE_DIM, ACTION_DIM)
-        agent.load_model(model_path)
-        agent.epsilon = 0.01  # 测试时用很小的探索率
+        if not agent.load_model(model_path):
+            print("使用新模型")
     else:
         print("使用新模型")
-        agent = DQNAgent(STATE_DIM, ACTION_DIM)
     
-    num_test_episodes = 10
+    agent.epsilon = 0.01  # 测试时用很小的探索率
+    
+    num_test_episodes = 5
     total_kills = 0
     total_steps = 0
     
@@ -491,7 +606,7 @@ def test_trained_model(model_path=None):
             kills = game.score // 70 if hasattr(game, 'score') else 0
             if kills > episode_kills:
                 episode_kills = kills
-                print(f"  步{step}: 击杀！")
+                print(f"  步{step}: 击杀！总击杀{kills}")
             
             # 更新
             state = next_state
@@ -527,21 +642,21 @@ def test_trained_model(model_path=None):
 
 # ============ 主函数 ============
 def main():
-    print("🎯 坦克游戏AI - 工作训练脚本（修复版）")
+    print("🎯 坦克游戏AI - 修复版训练脚本")
     print("=" * 60)
-    print("基于诊断结果设计:")
-    print("1. 规则AI能击杀 → 神经网络应该也能学习")
-    print("2. 增强奖励函数，明确反馈")
-    print("3. 使用更深的网络结构")
-    print("4. 经验回放 + 目标网络")
-    print("5. 修复了Pygame字体初始化问题")
+    print("主要修复:")
+    print("1. ✅ 状态维度从14修正为12")
+    print("2. ✅ 神经网络输入层匹配实际状态维度")
+    print("3. ✅ 添加维度检查和修复机制")
+    print("4. ✅ 改进奖励函数")
+    print("5. ✅ 更好的训练监控")
     print("=" * 60)
     
     while True:
         print("\n选项:")
         print("1. 开始训练DQN")
         print("2. 测试现有模型")
-        print("3. 快速测试（只运行规则AI）")
+        print("3. 运行快速诊断")
         print("4. 退出")
         
         choice = input("请选择 (1-4): ").strip()
@@ -560,79 +675,46 @@ def main():
             test_trained_model(model_path)
             
         elif choice == "3":
-            print("\n运行规则AI测试...")
-            # 确保Pygame初始化
-            try:
-                pygame.init()
-                pygame.font.init()
-            except:
-                pass
-            
-            # 使用之前的规则AI测试
+            print("\n运行快速诊断...")
             from tankgame import TankGame
-            import random
-            import math
             
-            game = TankGame(render=True)
+            game = TankGame(render=False)
             
-            test_episodes = 5
+            # 状态维度诊断
+            state = game.get_state()
+            print(f"状态维度: {len(state)}")
+            print(f"状态内容: {state}")
+            
+            # 测试动作执行
+            print("\n测试动作执行:")
+            for action_name, action in ACTION_MAP.items():
+                if action:
+                    print(f"  动作{action_name}: {action}")
+            
+            # 测试几轮随机AI
+            print("\n测试随机AI性能:")
             total_kills = 0
-            
-            for ep in range(test_episodes):
-                state = game.reset()
+            for ep in range(3):
+                game.reset()
                 kills = 0
-                
-                print(f"\n回合 {ep+1}:")
-                
-                for step in range(200):
-                    if game.game_over:
-                        break
+                for step in range(100):
+                    action = random.choice([1, 2, 3, 4, 5, 6])
+                    if action in ACTION_MAP and ACTION_MAP[action]:
+                        game.do_action(ACTION_MAP[action])
                     
-                    # 规则AI逻辑
-                    if game.enemies:
-                        enemy = game.enemies[0]
-                        dx = enemy.x - game.player.x
-                        dy = enemy.y - game.player.y
-                        target_angle = math.atan2(-dy, dx)
-                        current_angle = game.player.aim_angle
-                        
-                        angle_diff = (target_angle - current_angle) % (2 * math.pi)
-                        if angle_diff > math.pi:
-                            angle_diff -= 2 * math.pi
-                        
-                        if angle_diff > 0.1:
-                            action = ACTION_GUN_LEFT
-                        elif angle_diff < -0.1:
-                            action = ACTION_GUN_RIGHT
-                        else:
-                            game.player.auto_shoot = True
-                            action = random.choice([ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT])
-                    else:
-                        action = random.choice([ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT])
+                    if random.random() < 0.3:
+                        game.player.auto_shoot = True
                     
-                    # 执行动作
-                    game.do_action(action)
                     game.step()
                     
-                    # 检查击杀
                     current_kills = game.score // 70
                     if current_kills > kills:
                         kills = current_kills
-                        print(f"  步{step}: 击杀！总击杀{kills}")
-                    
-                    # 处理退出事件
-                    for event in pygame.event.get():
-                        if event.type == pygame.QUIT:
-                            pygame.quit()
-                            return
                 
                 total_kills += kills
-                print(f"  回合结束: 击杀{kills}")
+                print(f"  回合{ep+1}: 击杀{kills}")
             
-            pygame.quit()
-            
-            avg_kills = total_kills / test_episodes
-            print(f"\n📊 规则AI测试: 平均每回合{avg_kills:.1f}击杀")
+            print(f"随机AI平均击杀: {total_kills/3:.1f}")
             
         elif choice == "4":
             print("👋 退出")
@@ -646,54 +728,6 @@ if __name__ == "__main__":
     try:
         import torch
         main()
-    except ImportError:
-        print("❌ 需要安装PyTorch: pip install torch")
-        print("运行快速测试...")
-        
-        # 确保Pygame初始化
-        try:
-            pygame.init()
-            pygame.font.init()
-        except:
-            pass
-        
-        # 运行不需要PyTorch的测试
-        test_episodes = 3
-        total_kills = 0
-        
-        for ep in range(test_episodes):
-            game = TankGame(render=True)
-            state = game.reset()
-            kills = 0
-            
-            for step in range(200):
-                if game.game_over:
-                    break
-                
-                # 随机动作
-                action = random.choice([ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT, 
-                                       ACTION_GUN_LEFT, ACTION_GUN_RIGHT])
-                game.do_action(action)
-                
-                # 随机开火
-                if random.random() < 0.3:
-                    game.player.auto_shoot = True
-                
-                game.step()
-                
-                # 检查击杀
-                current_kills = game.score // 70
-                if current_kills > kills:
-                    kills = current_kills
-                    print(f"回合{ep+1} 步{step}: 击杀！")
-                
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        pygame.quit()
-                        exit()
-            
-            total_kills += kills
-            pygame.quit()
-        
-        avg_kills = total_kills / test_episodes
-        print(f"\n随机AI平均每回合击杀: {avg_kills:.1f}")
+    except ImportError as e:
+        print(f"❌ 缺少依赖: {e}")
+        print("请安装: pip install torch numpy")

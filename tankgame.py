@@ -10,7 +10,6 @@ SCREEN_HEIGHT = 600
 FPS = 60
 TANK_SIZE = 40
 BULLET_RADIUS = 5
-WALL_SIZE = 27
 TANK_SPEED = 4
 BULLET_BASE_SPEED = 12
 MAX_BOUNCES = 10
@@ -68,33 +67,13 @@ class Bullet:
         self.max_bounces = MAX_BOUNCES
         self.active = True
 
-    def move(self, walls):
+    def move(self):
+        """移除墙壁碰撞检测，只保留屏幕边界反弹"""
         if not self.active: return
         next_x = self.x + math.cos(self.angle) * self.speed
         next_y = self.y - math.sin(self.angle) * self.speed
-        bullet_rect = pygame.Rect(
-            next_x - self.radius, next_y - self.radius,
-            self.radius*2, self.radius*2
-        )
-        wall_collide = False
-        collide_x = False
-        collide_y = False
-        for wall in walls:
-            wall_rect = pygame.Rect(wall[0], wall[1], WALL_SIZE, WALL_SIZE)
-            if bullet_rect.colliderect(wall_rect):
-                wall_collide = True
-                collide_x = abs(bullet_rect.centerx - wall_rect.centerx) < (WALL_SIZE/2 + self.radius)
-                collide_y = abs(bullet_rect.centery - wall_rect.centery) < (WALL_SIZE/2 + self.radius)
-                break
-        if wall_collide:
-            if collide_x:
-                self.angle = -self.angle
-            if collide_y:
-                self.angle = math.pi - self.angle
-            self.bounce_count += 1
-            if self.bounce_count >= self.max_bounces:
-                self.active = False
-            return
+        
+        # 移除墙壁碰撞检测
         if next_x <= self.radius or next_x >= SCREEN_WIDTH - self.radius:
             self.angle = -self.angle
             self.bounce_count += 1
@@ -103,6 +82,7 @@ class Bullet:
             self.angle = math.pi - self.angle
             self.bounce_count += 1
             next_y = max(self.radius, min(SCREEN_HEIGHT - self.radius, next_y))
+        
         self.x = next_x
         self.y = next_y
         if self.bounce_count >= self.max_bounces:
@@ -139,17 +119,20 @@ class Tank:
         gun_y = self.y - math.sin(self.aim_angle) * 25
         pygame.draw.line(screen, BLACK, (self.x, self.y), (gun_x, gun_y), 5)
 
-    def move(self, dx, dy, walls):
+    def move(self, dx, dy):
+        """移除墙壁碰撞检测，只保留屏幕边界检测"""
         if not self.alive: return
+        # 处理对角线移动，使移动速度一致
+        if dx != 0 and dy != 0:
+            dx *= 0.7071  # 1/√2 ≈ 0.7071，保持对角线移动速度与单方向一致
+            dy *= 0.7071
+            
         new_x = self.x + dx * self.speed
         new_y = self.y + dy * self.speed
+        # 只检查屏幕边界，移除墙壁碰撞检测
         new_x = max(self.size//2, min(SCREEN_WIDTH - self.size//2, new_x))
         new_y = max(self.size//2, min(SCREEN_HEIGHT - self.size//2, new_y))
-        tank_rect = pygame.Rect(new_x-self.size//2, new_y-self.size//2, self.size, self.size)
-        for wall in walls:
-            wall_rect = pygame.Rect(wall[0], wall[1], WALL_SIZE, WALL_SIZE)
-            if tank_rect.colliderect(wall_rect):
-                return
+        
         self.x = new_x
         self.y = new_y
 
@@ -180,7 +163,7 @@ class TankGame:
         self.big_font = pygame.font.SysFont(None, 80) if self.is_render else None
         self.button_font = pygame.font.SysFont(None, 48) if self.is_render else None
         if self.is_render:
-            pygame.display.set_caption("坦克大战 - 带时间限制+敌方精准瞄准")
+            pygame.display.set_caption("坦克大战 - 无障碍物版")
         self.restart_btn = pygame.Rect(SCREEN_WIDTH//2 - 100, SCREEN_HEIGHT//2 + 50, 200, 60)
         self.game_over = False
         self.reset()
@@ -189,7 +172,7 @@ class TankGame:
         """重置游戏，AI调用：初始化所有游戏对象（含时间计时）"""
         self.player = Tank(SCREEN_WIDTH//2, SCREEN_HEIGHT-TANK_SIZE-20, GREEN, is_player=True)
         self.enemies = [Tank(random.randint(100,700), random.randint(100,200), BLUE) for _ in range(3)]
-        self.walls = self._generate_walls()
+        self.walls = []  # 移除墙壁
         self.bullets = []
         self.score = 0
         self.step_count = 0
@@ -202,17 +185,6 @@ class TankGame:
         self.remaining_time = GAME_TIME_LIMIT  # 剩余时间（秒）
         return self.get_state()
 
-    def _generate_walls(self):
-        walls = []
-        player_rect = pygame.Rect(self.player.x-60, self.player.y-60, 120, 120)
-        for _ in range(20):
-            x = random.randint(0, (SCREEN_WIDTH-WALL_SIZE)//WALL_SIZE)*WALL_SIZE
-            y = random.randint(0, (SCREEN_HEIGHT-WALL_SIZE*3)//WALL_SIZE)*WALL_SIZE
-            wall_rect = pygame.Rect(x, y, WALL_SIZE, WALL_SIZE)
-            if not wall_rect.colliderect(player_rect):
-                walls.append((x, y))
-        return walls
-
     def _get_nearest_enemy(self):
         if not [e for e in self.enemies if e.alive]: return None
         enemies_alive = [e for e in self.enemies if e.alive]
@@ -220,8 +192,8 @@ class TankGame:
         return enemies_alive[np.argmin(distances)]
 
     def get_state(self):
-        """AI核心接口1：获取14维归一化游戏状态，返回list（适配AI的torch张量转换）"""
-        state = np.zeros(14, dtype=np.float32)
+        """AI核心接口1：获取12维归一化游戏状态，返回list（适配AI的torch张量转换）"""
+        state = np.zeros(12, dtype=np.float32)
         player = self.player
         enemy = self._get_nearest_enemy()
         screen_diag = get_screen_diag()
@@ -239,16 +211,13 @@ class TankGame:
             dy = enemy.y - player.y
             enemy_angle = math.atan2(-dy, dx) % (2*math.pi)
             state[6] = normalize(enemy_angle, 0, 2*math.pi)
-            state[11] = normalize(enemy.lives, 0, 5)
-        state[7] = normalize(player.cooldown, 0, player.cooldown_max)
+            state[7] = normalize(enemy.lives, 0, 5)
+        state[8] = normalize(player.cooldown, 0, player.cooldown_max)
         player_bullets = [b for b in self.bullets if b.is_player_bullet]
-        state[8] = normalize(len(player_bullets), 0, 10)
+        state[9] = normalize(len(player_bullets), 0, 10)
         enemy_bullets = [b for b in self.bullets if not b.is_player_bullet]
-        state[9] = normalize(len(enemy_bullets), 0, 10)
-        state[10] = normalize(player.lives, 0, 5)
-        wall_dists = [distance_between(player.x, player.y, w[0]+WALL_SIZE//2, w[1]+WALL_SIZE//2) for w in self.walls]
-        state[12] = normalize(min(wall_dists), 0, screen_diag) if wall_dists else 1.0
-        state[13] = normalize(self.score, 0, 1000)
+        state[10] = normalize(len(enemy_bullets), 0, 10)
+        state[11] = normalize(player.lives, 0, 5)
         # 适配点：返回list而非np.array，避免AI代码中张量转换报错
         return state.tolist()
 
@@ -267,7 +236,41 @@ class TankGame:
         elif action == ACTION_GUN_RIGHT: d_angle = -deg2rad(3)
         elif action == ACTION_SHOOT: shoot = True
 
-        self.player.move(dx, dy, self.walls)
+        self.player.move(dx, dy)  # 移除墙壁参数
+        self.player.rotate_gun(d_angle)
+        if shoot:
+            bullet = self.player.shoot()
+            if bullet:
+                self.bullets.append(bullet)
+    
+    def do_actions(self, actions):
+        """新增：同时执行多个动作（用于手动游玩）"""
+        if not self.player.alive or self.game_over: return
+        
+        dx, dy, d_angle = 0, 0, 0
+        shoot = False
+        
+        # 处理移动组合
+        if ACTION_UP in actions:
+            dy -= 1
+        if ACTION_DOWN in actions:
+            dy += 1
+        if ACTION_LEFT in actions:
+            dx -= 1
+        if ACTION_RIGHT in actions:
+            dx += 1
+            
+        # 处理炮管旋转
+        if ACTION_GUN_LEFT in actions:
+            d_angle += deg2rad(3)
+        if ACTION_GUN_RIGHT in actions:
+            d_angle -= deg2rad(3)
+            
+        # 处理射击
+        if ACTION_SHOOT in actions:
+            shoot = True
+
+        self.player.move(dx, dy)  # 移除墙壁参数
         self.player.rotate_gun(d_angle)
         if shoot:
             bullet = self.player.shoot()
@@ -287,7 +290,7 @@ class TankGame:
 
             # 敌方随机移动
             if random.random() < 0.3:
-                enemy.move(random.choice([-1,0,1]), random.choice([-1,0,1]), self.walls)
+                enemy.move(random.choice([-1,0,1]), random.choice([-1,0,1]))
 
             # 敌方射击：限制子弹数量，轻微散布
             current_enemy_bullets = len([b for b in self.bullets if not b.is_player_bullet])
@@ -302,7 +305,7 @@ class TankGame:
         """游戏内部：子弹更新和碰撞检测"""
         if self.game_over: return
         for bullet in self.bullets:
-            bullet.move(self.walls)
+            bullet.move()  # 移除墙壁参数
         
         new_bullets = []
         for bullet in self.bullets:
@@ -409,10 +412,7 @@ class TankGame:
         if not self.is_render or not self.screen: return
         self.screen.fill(BLACK)
         if not self.game_over:
-            # 绘制墙体
-            for wall in self.walls:
-                pygame.draw.rect(self.screen, GRAY, (wall[0], wall[1], WALL_SIZE, WALL_SIZE))
-                pygame.draw.rect(self.screen, BLACK, (wall[0], wall[1], WALL_SIZE, WALL_SIZE), 1)
+            # 不再绘制墙体
             # 绘制坦克和子弹
             self.player.draw(self.screen)
             for enemy in self.enemies:
@@ -441,6 +441,8 @@ class TankGame:
     def manual_play(self):
         """独立运行：人类手动玩游戏（含重新开始交互）"""
         print("开始手动玩游戏！W/A/S/D移动，←/→转炮管，空格射击，Q退出")
+        print("提示：现在可以同时按下多个按键了！")
+        print("例如：W+D向右上移动，同时按←/→旋转炮管，同时按空格射击")
         self.reset()
         while True:
             for event in pygame.event.get():
@@ -453,15 +455,24 @@ class TankGame:
             self._check_restart_click()
             if not self.game_over:
                 keys = pygame.key.get_pressed()
-                action = ACTION_IDLE
-                if keys[pygame.K_w]: action = ACTION_UP
-                elif keys[pygame.K_s]: action = ACTION_DOWN
-                elif keys[pygame.K_a]: action = ACTION_LEFT
-                elif keys[pygame.K_d]: action = ACTION_RIGHT
-                elif keys[pygame.K_LEFT]: action = ACTION_GUN_LEFT
-                elif keys[pygame.K_RIGHT]: action = ACTION_GUN_RIGHT
-                elif keys[pygame.K_SPACE]: action = ACTION_SHOOT
-                self.do_action(action)
+                actions = []
+                # 移动按键检测 - 可以同时按
+                if keys[pygame.K_w]: actions.append(ACTION_UP)
+                if keys[pygame.K_s]: actions.append(ACTION_DOWN)
+                if keys[pygame.K_a]: actions.append(ACTION_LEFT)
+                if keys[pygame.K_d]: actions.append(ACTION_RIGHT)
+                # 瞄准按键检测 - 可以和移动同时按
+                if keys[pygame.K_LEFT]: actions.append(ACTION_GUN_LEFT)
+                if keys[pygame.K_RIGHT]: actions.append(ACTION_GUN_RIGHT)
+                # 射击按键检测 - 可以和移动、瞄准同时按
+                if keys[pygame.K_SPACE]: actions.append(ACTION_SHOOT)
+                
+                # 执行多个动作
+                if actions:
+                    self.do_actions(actions)
+                else:
+                    # 如果没有按任何键，坦克保持静止
+                    pass
             self.step()
 
 # ====================== 独立运行游戏（测试用） =======================
