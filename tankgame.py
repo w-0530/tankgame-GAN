@@ -151,6 +151,10 @@ class Tank:
     def update_cooldown(self):
         if self.cooldown > 0:
             self.cooldown -= 1
+    
+    def set_auto_shoot(self, enabled):
+        """启用或禁用自动开火功能"""
+        self.auto_shoot = enabled
 
 # ====================== 核心游戏类（暴露AI接口，可独立运行） =======================
 class TankGame:
@@ -192,32 +196,101 @@ class TankGame:
         return enemies_alive[np.argmin(distances)]
 
     def get_state(self):
-        """AI核心接口1：获取12维归一化游戏状态，返回list（适配AI的torch张量转换）"""
-        state = np.zeros(12, dtype=np.float32)
+        """AI核心接口1：获取增强的33维归一化游戏状态，包含更多战术信息"""
+        state = np.zeros(33, dtype=np.float32)
         player = self.player
         enemy = self._get_nearest_enemy()
         screen_diag = get_screen_diag()
 
+        # 玩家信息 (5维)
         state[0] = normalize(player.x, 0, SCREEN_WIDTH)
         state[1] = normalize(player.y, 0, SCREEN_HEIGHT)
         state[2] = normalize(player.aim_angle, 0, 2*math.pi)
+        state[3] = normalize(player.lives, 0, 5)
+        state[4] = normalize(player.cooldown, 0, player.cooldown_max)
+        
+        # 最近敌人信息 (7维)
         if enemy:
-            state[3] = normalize(enemy.x, 0, SCREEN_WIDTH)
-            state[4] = normalize(enemy.y, 0, SCREEN_HEIGHT)
+            state[5] = normalize(enemy.x, 0, SCREEN_WIDTH)
+            state[6] = normalize(enemy.y, 0, SCREEN_HEIGHT)
             dist = distance_between(player.x, player.y, enemy.x, enemy.y)
-            state[5] = normalize(dist, 0, screen_diag)
-            # 玩家朝向敌人的角度也用相同计算逻辑，保证AI状态数据准确
+            state[7] = normalize(dist, 0, screen_diag)
+            # 敌人朝向角度和相对角度
             dx = enemy.x - player.x
             dy = enemy.y - player.y
             enemy_angle = math.atan2(-dy, dx) % (2*math.pi)
-            state[6] = normalize(enemy_angle, 0, 2*math.pi)
-            state[7] = normalize(enemy.lives, 0, 5)
-        state[8] = normalize(player.cooldown, 0, player.cooldown_max)
-        player_bullets = [b for b in self.bullets if b.is_player_bullet]
-        state[9] = normalize(len(player_bullets), 0, 10)
+            state[8] = normalize(enemy_angle, 0, 2*math.pi)
+            # 瞄准角度差异
+            angle_diff = abs(player.aim_angle - enemy_angle)
+            angle_diff = min(angle_diff, 2*math.pi - angle_diff)
+            state[9] = normalize(angle_diff, 0, math.pi)  # 角度差
+            state[10] = normalize(enemy.lives, 0, 5)
+            state[11] = 1.0  # 敌人存在标记
+        else:
+            state[5:12] = 0  # 无敌人时全零
+            state[11] = 0
+        
+        # 敌人子弹威胁信息 (12维) - 最多跟踪6颗最近的敌人子弹
         enemy_bullets = [b for b in self.bullets if not b.is_player_bullet]
-        state[10] = normalize(len(enemy_bullets), 0, 10)
-        state[11] = normalize(player.lives, 0, 5)
+        enemy_bullets_sorted = sorted(enemy_bullets, 
+                                     key=lambda b: distance_between(player.x, player.y, b.x, b.y))
+        
+        for i in range(6):  # 最多6颗子弹
+            if i < len(enemy_bullets_sorted):
+                bullet = enemy_bullets_sorted[i]
+                bullet_dist = distance_between(player.x, player.y, bullet.x, bullet.y)
+                
+                # 子弹位置
+                state[12 + i*2] = normalize(bullet.x, 0, SCREEN_WIDTH)
+                state[13 + i*2] = normalize(bullet.y, 0, SCREEN_HEIGHT)
+                
+                # 子弹威胁度评估
+                if bullet_dist < 200:  # 危险距离内
+                    # 计算子弹是否朝向玩家
+                    bullet_to_player_x = player.x - bullet.x
+                    bullet_to_player_y = player.y - bullet.y
+                    bullet_to_player_angle = math.atan2(-bullet_to_player_y, bullet_to_player_x)
+                    bullet_angle_diff = abs(bullet.angle - bullet_to_player_angle)
+                    bullet_angle_diff = min(bullet_angle_diff, 2*math.pi - bullet_angle_diff)
+                    
+                    # 威胁度：距离越近、角度越对准，威胁越大
+                    threat_level = (1.0 - bullet_dist/200) * (1.0 - bullet_angle_diff/math.pi)
+                    state[24 + i] = threat_level
+                else:
+                    state[24 + i] = 0
+            else:
+                state[12 + i*2] = -1.0  # 无子弹位置标记
+                state[13 + i*2] = -1.0
+                state[24 + i] = 0
+        
+        # 战术位置信息 (3维)
+        if enemy:
+            # 重新计算距离（避免作用域问题）
+            current_dist = distance_between(player.x, player.y, enemy.x, enemy.y)
+            
+            # 安全区域评估：距离边界的距离
+            dist_to_left = player.x
+            dist_to_right = SCREEN_WIDTH - player.x
+            dist_to_top = player.y
+            dist_to_bottom = SCREEN_HEIGHT - player.y
+            min_dist_to_edge = min(dist_to_left, dist_to_right, dist_to_top, dist_to_bottom)
+            state[30] = normalize(min_dist_to_edge, 0, min(SCREEN_WIDTH, SCREEN_HEIGHT)/2)
+            
+            # 战术优势：玩家是否在更好的位置（可以攻击但不容易被反击）
+            if 150 <= current_dist <= 400:  # 理想攻击距离
+                state[31] = 1.0
+            elif current_dist < 150:  # 太近，危险
+                state[31] = 0.3
+            else:  # 太远
+                state[31] = 0.5
+        else:
+            state[30] = 0
+            state[31] = 0
+        
+        # 时间压力信息 (1维)
+        time_pressure = 1.0 - normalize(self.remaining_time, 0, GAME_TIME_LIMIT)
+        state[32] = time_pressure  # 时间越少，压力越大
+        
         # 适配点：返回list而非np.array，避免AI代码中张量转换报错
         return state.tolist()
 
@@ -352,25 +425,100 @@ class TankGame:
     def step(self):
         """游戏内部：单步更新游戏逻辑（AI调用后，更新游戏状态），返回(reward, done)"""
         if self.game_over: return 0, True
-        self._update_timer()
-        self.step_count += 1
-        self.player.update_cooldown()
         
-        # ============== 核心修改2：AI自动开火逻辑（仅AI控制时生效） ==============
-        if self.player.auto_shoot and self.player.alive:
-            bullet = self.player.shoot()
-            if bullet:
-                self.bullets.append(bullet)
+        if self.is_render:
+            # 渲染模式：正常更新
+            self._update_timer()
+            self.step_count += 1
+            self.player.update_cooldown()
+            
+            # AI自动开火逻辑
+            if self.player.auto_shoot and self.player.alive and self.player.cooldown == 0:
+                enemy = self._get_nearest_enemy()
+                if enemy and enemy.alive:
+                    dx = enemy.x - self.player.x
+                    dy = enemy.y - self.player.y
+                    target_angle = math.atan2(-dy, dx) % (2*math.pi)
+                    angle_diff = abs(self.player.aim_angle - target_angle)
+                    angle_diff = min(angle_diff, 2*math.pi - angle_diff)
+                    if angle_diff < math.pi/12:
+                        bullet = self.player.shoot()
+                        if bullet:
+                            self.bullets.append(bullet)
+            
+            self._update_enemies()
+            self._update_bullets()
+            self.render()  # 调用公开的render方法
+        else:
+            # 训练模式：快速更新，跳过渲染
+            self._update_no_render()
         
-        self._update_enemies()
-        self._update_bullets()
-        self.render()  # 调用公开的render方法
-        # 计算基础奖励
+        # === 彻底重构奖励函数 - 解决根本矛盾 ===
         reward = 0
-        reward += self.score - self.last_score
+        
+        # 1. 核心事件奖励（统一score和reward信号）
+        score_delta = self.score - self.last_score
+        if score_delta > 0:
+            reward += score_delta * 5  # 正面事件：击中敌人+35分，击杀+350分
+        
+        # 2. 生存时间奖励（替代每步惩罚）
+        if self.player.alive:
+            reward += 0.1  # 生存奖励，鼓励存活更久
+        
+        # 3. 被击中惩罚（适度，不过分打击探索）
         if self.player.lives < self.last_lives:
-            reward -= 10
+            reward -= 5  # 适度惩罚
             self.last_lives = self.player.lives
+        
+        # 4. 移动奖励（新增 - 解决移动头停滞）
+        current_pos = (self.player.x, self.player.y)
+        if not hasattr(self, 'last_position'):
+            self.last_position = current_pos
+        
+        movement_distance = distance_between(current_pos[0], current_pos[1], 
+                                          self.last_position[0], self.last_position[1])
+        if movement_distance > 1:  # 有明显移动
+            reward += 0.05  # 鼓励移动探索
+        self.last_position = current_pos
+        
+        # 5. 战术位置奖励（鼓励接近敌人但保持安全距离）
+        enemy = self._get_nearest_enemy()
+        if enemy and enemy.alive:
+            dist = distance_between(self.player.x, self.player.y, enemy.x, enemy.y)
+            # 黄金距离区间：150-300像素
+            if 150 <= dist <= 300:
+                reward += 0.2  # 战术位置奖励
+            elif dist < 150:  # 太近了，危险
+                reward -= 0.1
+            elif dist <= 450:  # 仍在有效攻击范围内
+                reward += 0.05
+        
+        # 6. 瞄准精度奖励（适度奖励，不主导）
+        if enemy and enemy.alive:
+            dx = enemy.x - self.player.x
+            dy = enemy.y - self.player.y
+            target_angle = math.atan2(-dy, dx) % (2*math.pi)
+            angle_diff = abs(self.player.aim_angle - target_angle)
+            angle_diff = min(angle_diff, 2*math.pi - angle_diff)
+            # 精度越高奖励越大
+            if angle_diff < math.pi/36:  # 5度内
+                reward += 0.1
+            elif angle_diff < math.pi/18:  # 10度内
+                reward += 0.05
+                
+        # 7. 射击时机奖励（鼓励有效射击）
+        if enemy and enemy.alive:
+            dx = enemy.x - self.player.x
+            dy = enemy.y - self.player.y
+            target_angle = math.atan2(-dy, dx) % (2*math.pi)
+            angle_diff = abs(self.player.aim_angle - target_angle)
+            angle_diff = min(angle_diff, 2*math.pi - angle_diff)
+            # 只有瞄准较好时射击才给奖励
+            if angle_diff < math.pi/12 and len([b for b in self.bullets if b.is_player_bullet]) < 3:
+                if self.player.cooldown > 0 and self.player.cooldown == self.player.cooldown_max - 1:
+                    # 刚刚射击，且瞄准较好
+                    reward += 0.3
+        
         self.last_score = self.score
         # 游戏结束条件
         done = self.game_over or self.step_count >= self.max_steps or self.score >= 1000
@@ -431,12 +579,44 @@ class TankGame:
             self._draw_game_over()
         pygame.display.flip()
         self.clock.tick(FPS)
+    
+    def _update_no_render(self):
+        """训练时的快速更新，跳过渲染和帧率限制"""
+        if self.game_over: return
+        self.step_count += 1
+        self.player.update_cooldown()
+        
+        # AI自动开火逻辑
+        if self.player.auto_shoot and self.player.alive and self.player.cooldown == 0:
+            enemy = self._get_nearest_enemy()
+            if enemy and enemy.alive:
+                dx = enemy.x - self.player.x
+                dy = enemy.y - self.player.y
+                target_angle = math.atan2(-dy, dx) % (2*math.pi)
+                angle_diff = abs(self.player.aim_angle - target_angle)
+                angle_diff = min(angle_diff, 2*math.pi - angle_diff)
+                if angle_diff < math.pi/12:
+                    bullet = self.player.shoot()
+                    if bullet:
+                        self.bullets.append(bullet)
+        
+        self._update_enemies()
+        self._update_bullets()
+        self._update_timer()
 
     def _check_restart_click(self):
         """检测重新开始按钮点击"""
         if self.game_over and pygame.mouse.get_pressed()[0]:
             if self.restart_btn.collidepoint(pygame.mouse.get_pos()):
                 self.reset()
+
+    def enable_auto_shoot(self):
+        """启用AI自动开火功能（瞄准后自动开火）"""
+        self.player.set_auto_shoot(True)
+    
+    def disable_auto_shoot(self):
+        """禁用AI自动开火功能"""
+        self.player.set_auto_shoot(False)
 
     def manual_play(self):
         """独立运行：人类手动玩游戏（含重新开始交互）"""
