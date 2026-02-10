@@ -196,100 +196,205 @@ class TankGame:
         return enemies_alive[np.argmin(distances)]
 
     def get_state(self):
-        """AI核心接口1：获取增强的33维归一化游戏状态，包含更多战术信息"""
-        state = np.zeros(33, dtype=np.float32)
+        """AI核心接口1：获取超增强的67维归一化游戏状态，包含全面战术信息"""
+        state = np.zeros(67, dtype=np.float32)
         player = self.player
         enemy = self._get_nearest_enemy()
         screen_diag = get_screen_diag()
 
-        # 玩家信息 (5维)
+        # === 玩家核心信息 (8维) ===
         state[0] = normalize(player.x, 0, SCREEN_WIDTH)
         state[1] = normalize(player.y, 0, SCREEN_HEIGHT)
         state[2] = normalize(player.aim_angle, 0, 2*math.pi)
         state[3] = normalize(player.lives, 0, 5)
         state[4] = normalize(player.cooldown, 0, player.cooldown_max)
+        # 新增：玩家速度和朝向
+        state[5] = normalize(player.speed, 0, 10)
+        state[6] = math.cos(player.aim_angle)  # 瞄准方向X分量
+        state[7] = math.sin(player.aim_angle)  # 瞄准方向Y分量
         
-        # 最近敌人信息 (7维)
+        # === 最近敌人详细信息 (12维) ===
         if enemy:
-            state[5] = normalize(enemy.x, 0, SCREEN_WIDTH)
-            state[6] = normalize(enemy.y, 0, SCREEN_HEIGHT)
+            state[8] = normalize(enemy.x, 0, SCREEN_WIDTH)
+            state[9] = normalize(enemy.y, 0, SCREEN_HEIGHT)
             dist = distance_between(player.x, player.y, enemy.x, enemy.y)
-            state[7] = normalize(dist, 0, screen_diag)
-            # 敌人朝向角度和相对角度
+            state[10] = normalize(dist, 0, screen_diag)
+            # 敌人朝向和相对角度
             dx = enemy.x - player.x
             dy = enemy.y - player.y
             enemy_angle = math.atan2(-dy, dx) % (2*math.pi)
-            state[8] = normalize(enemy_angle, 0, 2*math.pi)
+            state[11] = normalize(enemy_angle, 0, 2*math.pi)
             # 瞄准角度差异
             angle_diff = abs(player.aim_angle - enemy_angle)
             angle_diff = min(angle_diff, 2*math.pi - angle_diff)
-            state[9] = normalize(angle_diff, 0, math.pi)  # 角度差
-            state[10] = normalize(enemy.lives, 0, 5)
-            state[11] = 1.0  # 敌人存在标记
+            state[12] = normalize(angle_diff, 0, math.pi)
+            state[13] = normalize(enemy.lives, 0, 5)
+            state[14] = normalize(enemy.cooldown, 0, enemy.cooldown_max)
+            state[15] = normalize(enemy.speed, 0, 10)
+            # 敌人朝向分量
+            state[16] = math.cos(enemy.aim_angle)
+            state[17] = math.sin(enemy.aim_angle)
+            state[18] = 1.0  # 敌人存在标记
+            state[19] = 1.0 - normalize(dist, 0, screen_diag)  # 敌人接近度
         else:
-            state[5:12] = 0  # 无敌人时全零
-            state[11] = 0
+            state[8:20] = 0  # 无敌人时全零
+            state[18] = 0
         
-        # 敌人子弹威胁信息 (12维) - 最多跟踪6颗最近的敌人子弹
+        # === 所有敌人概览信息 (8维) ===
+        enemies_alive = [e for e in self.enemies if e.alive]
+        state[20] = normalize(len(enemies_alive), 0, 5)
+        if enemies_alive:
+            # 敌人群体中心
+            avg_enemy_x = np.mean([e.x for e in enemies_alive])
+            avg_enemy_y = np.mean([e.y for e in enemies_alive])
+            state[21] = normalize(avg_enemy_x, 0, SCREEN_WIDTH)
+            state[22] = normalize(avg_enemy_y, 0, SCREEN_HEIGHT)
+            # 到群体中心的距离
+            center_dist = distance_between(player.x, player.y, avg_enemy_x, avg_enemy_y)
+            state[23] = normalize(center_dist, 0, screen_diag)
+            # 敌人分布离散度
+            enemy_positions = [(e.x, e.y) for e in enemies_alive]
+            if len(enemy_positions) > 1:
+                distances = [distance_between(p1[0], p1[1], p2[0], p2[1]) 
+                            for i, p1 in enumerate(enemy_positions) 
+                            for p2 in enemy_positions[i+1:]]
+                state[24] = normalize(np.std(distances), 0, screen_diag)
+            else:
+                state[24] = 0
+            # 敌人总生命值
+            total_enemy_lives = sum(e.lives for e in enemies_alive)
+            state[25] = normalize(total_enemy_lives, 0, 15)
+        else:
+            state[20:26] = 0
+        
+        # === 玩家子弹信息 (8维) ===
+        player_bullets = [b for b in self.bullets if b.is_player_bullet]
+        state[26] = normalize(len(player_bullets), 0, 10)
+        if player_bullets:
+            # 最近玩家子弹信息
+            nearest_player_bullet = min(player_bullets, 
+                                        key=lambda b: distance_between(enemy.x if enemy else 0, enemy.y if enemy else 0, b.x, b.y))
+            if enemy:
+                bullet_to_enemy_dist = distance_between(nearest_player_bullet.x, nearest_player_bullet.y, enemy.x, enemy.y)
+                state[27] = normalize(bullet_to_enemy_dist, 0, screen_diag)
+                # 子弹是否朝向敌人
+                dx = enemy.x - nearest_player_bullet.x
+                dy = enemy.y - nearest_player_bullet.y
+                bullet_to_enemy_angle = math.atan2(-dy, dx)
+                bullet_angle_diff = abs(nearest_player_bullet.angle - bullet_to_enemy_angle)
+                bullet_angle_diff = min(bullet_angle_diff, 2*math.pi - bullet_angle_diff)
+                state[28] = 1.0 - normalize(bullet_angle_diff, 0, math.pi)
+            else:
+                state[27] = 0.5
+                state[28] = 0
+            # 子弹平均速度和方向
+            avg_bullet_speed = np.mean([b.speed for b in player_bullets])
+            state[29] = normalize(avg_bullet_speed, 0, 20)
+            # 子弹分布
+            if len(player_bullets) > 1:
+                bullet_positions = [(b.x, b.y) for b in player_bullets]
+                distances = [distance_between(p1[0], p1[1], p2[0], p2[1]) 
+                            for i, p1 in enumerate(bullet_positions) 
+                            for p2 in bullet_positions[i+1:]]
+                state[30] = normalize(np.std(distances), 0, screen_diag)
+            else:
+                state[30] = 0
+        else:
+            state[26:31] = 0
+        
+        # === 敌人子弹威胁信息 (16维) - 最多跟踪8颗子弹 ===
         enemy_bullets = [b for b in self.bullets if not b.is_player_bullet]
         enemy_bullets_sorted = sorted(enemy_bullets, 
                                      key=lambda b: distance_between(player.x, player.y, b.x, b.y))
         
-        for i in range(6):  # 最多6颗子弹
+        for i in range(8):  # 最多8颗子弹
             if i < len(enemy_bullets_sorted):
                 bullet = enemy_bullets_sorted[i]
                 bullet_dist = distance_between(player.x, player.y, bullet.x, bullet.y)
                 
-                # 子弹位置
-                state[12 + i*2] = normalize(bullet.x, 0, SCREEN_WIDTH)
-                state[13 + i*2] = normalize(bullet.y, 0, SCREEN_HEIGHT)
+                # 子弹位置 (2维)
+                state[31 + i*2] = normalize(bullet.x, 0, SCREEN_WIDTH)
+                state[32 + i*2] = normalize(bullet.y, 0, SCREEN_HEIGHT)
                 
-                # 子弹威胁度评估
-                if bullet_dist < 200:  # 危险距离内
-                    # 计算子弹是否朝向玩家
+                # 高级威胁评估 (2维)
+                if bullet_dist < 300:  # 扩大威胁检测范围
+                    # 计算子弹轨迹预测
+                    future_steps = int(bullet_dist / bullet.speed) if bullet.speed > 0 else 10
+                    future_x = bullet.x + math.cos(bullet.angle) * bullet.speed * future_steps
+                    future_y = bullet.y - math.sin(bullet.angle) * bullet.speed * future_steps
+                    future_dist = distance_between(player.x, player.y, future_x, future_y)
+                    
+                    # 威胁等级：基于当前距离、未来距离和角度
                     bullet_to_player_x = player.x - bullet.x
                     bullet_to_player_y = player.y - bullet.y
                     bullet_to_player_angle = math.atan2(-bullet_to_player_y, bullet_to_player_x)
                     bullet_angle_diff = abs(bullet.angle - bullet_to_player_angle)
                     bullet_angle_diff = min(bullet_angle_diff, 2*math.pi - bullet_angle_diff)
                     
-                    # 威胁度：距离越近、角度越对准，威胁越大
-                    threat_level = (1.0 - bullet_dist/200) * (1.0 - bullet_angle_diff/math.pi)
-                    state[24 + i] = threat_level
+                    # 综合威胁度
+                    proximity_threat = 1.0 - min(bullet_dist/300, 1.0)
+                    trajectory_threat = 1.0 - min(future_dist/300, 1.0)
+                    angle_threat = 1.0 - normalize(bullet_angle_diff, 0, math.pi)
+                    
+                    state[47 + i] = (proximity_threat + trajectory_threat + angle_threat) / 3.0
+                    state[55 + i] = bullet.bounce_count / bullet.max_bounces  # 反弹次数
                 else:
-                    state[24 + i] = 0
+                    state[47 + i] = 0
+                    state[55 + i] = 0
             else:
-                state[12 + i*2] = -1.0  # 无子弹位置标记
-                state[13 + i*2] = -1.0
-                state[24 + i] = 0
+                state[31 + i*2] = -1.0  # 无子弹位置标记
+                state[32 + i*2] = -1.0
+                state[47 + i] = 0
+                state[55 + i] = 0
         
-        # 战术位置信息 (3维)
+        # === 高级战术信息 (8维) ===
         if enemy:
-            # 重新计算距离（避免作用域问题）
             current_dist = distance_between(player.x, player.y, enemy.x, enemy.y)
             
-            # 安全区域评估：距离边界的距离
+            # 安全区域评估 (4维)
             dist_to_left = player.x
             dist_to_right = SCREEN_WIDTH - player.x
             dist_to_top = player.y
             dist_to_bottom = SCREEN_HEIGHT - player.y
-            min_dist_to_edge = min(dist_to_left, dist_to_right, dist_to_top, dist_to_bottom)
-            state[30] = normalize(min_dist_to_edge, 0, min(SCREEN_WIDTH, SCREEN_HEIGHT)/2)
+            state[56] = normalize(dist_to_left, 0, SCREEN_WIDTH)
+            state[57] = normalize(dist_to_right, 0, SCREEN_WIDTH)
+            state[58] = normalize(dist_to_top, 0, SCREEN_HEIGHT)
+            state[59] = normalize(dist_to_bottom, 0, SCREEN_HEIGHT)
             
-            # 战术优势：玩家是否在更好的位置（可以攻击但不容易被反击）
-            if 150 <= current_dist <= 400:  # 理想攻击距离
-                state[31] = 1.0
-            elif current_dist < 150:  # 太近，危险
-                state[31] = 0.3
-            else:  # 太远
-                state[31] = 0.5
+            # 战术位置评估 (2维)
+            if 200 <= current_dist <= 350:  # 理想攻击距离
+                state[60] = 1.0
+            elif 150 <= current_dist < 200:
+                state[60] = 0.7
+            elif current_dist < 150:
+                state[60] = 0.2
+            else:
+                state[60] = 0.5
+            
+            # 角度优势：侧翼攻击
+            dx = enemy.x - player.x
+            dy = enemy.y - player.y
+            enemy_to_player_angle = math.atan2(-dy, dx) % (2*math.pi)
+            flank_angle = abs(enemy_to_player_angle - enemy.aim_angle)
+            flank_angle = min(flank_angle, 2*math.pi - flank_angle)
+            if math.pi/4 < flank_angle < 3*math.pi/4:
+                state[61] = 1.0  # 侧翼优势
+            else:
+                state[61] = 0.3
+            
+            # 火力优势评估
+            player_bullets = len([b for b in self.bullets if b.is_player_bullet])
+            enemy_bullets = len([b for b in self.bullets if not b.is_player_bullet])
+            state[62] = normalize(player_bullets - enemy_bullets, -10, 10)
+            state[63] = normalize(player.cooldown - enemy.cooldown, -50, 50)
         else:
-            state[30] = 0
-            state[31] = 0
+            state[56:64] = 0
         
-        # 时间压力信息 (1维)
+        # === 游戏状态信息 (3维) ===
+        state[64] = normalize(self.score, 0, 1000)
+        state[65] = normalize(self.step_count, 0, self.max_steps)
         time_pressure = 1.0 - normalize(self.remaining_time, 0, GAME_TIME_LIMIT)
-        state[32] = time_pressure  # 时间越少，压力越大
+        state[66] = time_pressure
         
         # 适配点：返回list而非np.array，避免AI代码中张量转换报错
         return state.tolist()
@@ -453,71 +558,128 @@ class TankGame:
             # 训练模式：快速更新，跳过渲染
             self._update_no_render()
         
-        # === 彻底重构奖励函数 - 解决根本矛盾 ===
+        # === 高性能奖励函数设计 - 强化学习信号 ===
         reward = 0
         
-        # 1. 核心事件奖励（统一score和reward信号）
+        # 1. 核心事件奖励（大幅增强）
         score_delta = self.score - self.last_score
         if score_delta > 0:
-            reward += score_delta * 5  # 正面事件：击中敌人+35分，击杀+350分
+            reward += score_delta * 10  # 增强到10倍，击中+70分，击杀+700分
         
-        # 2. 生存时间奖励（替代每步惩罚）
+        # 2. 生存和进度奖励（持续激励）
         if self.player.alive:
-            reward += 0.1  # 生存奖励，鼓励存活更久
+            reward += 0.2  # 增强生存奖励
+            # 时间进度奖励：鼓励在有限时间内取得进展
+            if self.remaining_time > 30:
+                reward += 0.1  # 充足时间内的额外奖励
+            elif self.remaining_time <= 10:
+                reward += 0.3  # 时间压力下的生存奖励
         
-        # 3. 被击中惩罚（适度，不过分打击探索）
+        # 3. 被击中惩罚（更严厉但平衡）
         if self.player.lives < self.last_lives:
-            reward -= 5  # 适度惩罚
+            reward -= 8  # 增加惩罚力度
             self.last_lives = self.player.lives
         
-        # 4. 移动奖励（新增 - 解决移动头停滞）
+        # 4. 移动和探索奖励（大幅增强）
         current_pos = (self.player.x, self.player.y)
         if not hasattr(self, 'last_position'):
             self.last_position = current_pos
+            self.position_history = [current_pos]
         
         movement_distance = distance_between(current_pos[0], current_pos[1], 
                                           self.last_position[0], self.last_position[1])
-        if movement_distance > 1:  # 有明显移动
-            reward += 0.05  # 鼓励移动探索
+        if movement_distance > 2:  # 提高移动阈值
+            reward += 0.15  # 增强移动奖励
+            # 探索新区域奖励
+            self.position_history.append(current_pos)
+            if len(self.position_history) > 20:
+                self.position_history.pop(0)
+            # 计算位置多样性
+            if len(set((int(x//50), int(y//50)) for x, y in self.position_history)) > 3:
+                reward += 0.1  # 区域探索奖励
         self.last_position = current_pos
         
-        # 5. 战术位置奖励（鼓励接近敌人但保持安全距离）
+        # 5. 高级战术位置奖励
         enemy = self._get_nearest_enemy()
         if enemy and enemy.alive:
             dist = distance_between(self.player.x, self.player.y, enemy.x, enemy.y)
-            # 黄金距离区间：150-300像素
-            if 150 <= dist <= 300:
-                reward += 0.2  # 战术位置奖励
-            elif dist < 150:  # 太近了，危险
-                reward -= 0.1
-            elif dist <= 450:  # 仍在有效攻击范围内
-                reward += 0.05
-        
-        # 6. 瞄准精度奖励（适度奖励，不主导）
-        if enemy and enemy.alive:
-            dx = enemy.x - self.player.x
-            dy = enemy.y - self.player.y
-            target_angle = math.atan2(-dy, dx) % (2*math.pi)
-            angle_diff = abs(self.player.aim_angle - target_angle)
-            angle_diff = min(angle_diff, 2*math.pi - angle_diff)
-            # 精度越高奖励越大
-            if angle_diff < math.pi/36:  # 5度内
+            
+            # 精确的黄金距离区间奖励
+            if 200 <= dist <= 350:  # 调整到更优的攻击距离
+                reward += 0.4  # 大幅增强战术位置奖励
+            elif 150 <= dist < 200:
+                reward += 0.2
+            elif dist < 150:  # 危险距离
+                reward -= 0.2
+            elif 350 < dist <= 500:  # 中等距离
                 reward += 0.1
-            elif angle_diff < math.pi/18:  # 10度内
-                reward += 0.05
-                
-        # 7. 射击时机奖励（鼓励有效射击）
+            
+            # 角度优势奖励：侧翼攻击
+            dx = enemy.x - self.player.x
+            dy = enemy.y - self.player.y
+            enemy_to_player_angle = math.atan2(-dy, dx) % (2*math.pi)
+            # 假设敌人朝向玩家，计算侧翼角度
+            flank_angle = abs(enemy_to_player_angle - math.atan2(-dy, dx))
+            flank_angle = min(flank_angle, 2*math.pi - flank_angle)
+            if math.pi/4 < flank_angle < 3*math.pi/4:  # 侧翼位置
+                reward += 0.2
+        
+        # 6. 精确瞄准奖励（增强且分级）
         if enemy and enemy.alive:
             dx = enemy.x - self.player.x
             dy = enemy.y - self.player.y
             target_angle = math.atan2(-dy, dx) % (2*math.pi)
             angle_diff = abs(self.player.aim_angle - target_angle)
             angle_diff = min(angle_diff, 2*math.pi - angle_diff)
-            # 只有瞄准较好时射击才给奖励
-            if angle_diff < math.pi/12 and len([b for b in self.bullets if b.is_player_bullet]) < 3:
+            
+            # 分级精度奖励
+            if angle_diff < math.pi/90:  # 2度内，精确瞄准
+                reward += 0.3
+            elif angle_diff < math.pi/45:  # 4度内
+                reward += 0.2
+            elif angle_diff < math.pi/18:  # 10度内
+                reward += 0.1
+                
+        # 7. 智能射击奖励（大幅增强）
+        if enemy and enemy.alive:
+            dx = enemy.x - self.player.x
+            dy = enemy.y - self.player.y
+            target_angle = math.atan2(-dy, dx) % (2*math.pi)
+            angle_diff = abs(self.player.aim_angle - target_angle)
+            angle_diff = min(angle_diff, 2*math.pi - angle_diff)
+            
+            # 射击时机判断
+            player_bullets = len([b for b in self.bullets if b.is_player_bullet])
+            if angle_diff < math.pi/15 and player_bullets < 4:  # 良好瞄准且子弹不过多
                 if self.player.cooldown > 0 and self.player.cooldown == self.player.cooldown_max - 1:
-                    # 刚刚射击，且瞄准较好
-                    reward += 0.3
+                    # 刚刚射击
+                    reward += 0.5  # 大幅增强射击奖励
+                    # 距离加成：近距离射击奖励更高
+                    dist = distance_between(self.player.x, self.player.y, enemy.x, enemy.y)
+                    if dist < 300:
+                        reward += 0.2
+        
+        # 8. 连击和表现奖励（新增）
+        if not hasattr(self, 'last_hit_time'):
+            self.last_hit_time = -100
+            self.combo_count = 0
+        
+        # 检测连击
+        if score_delta > 0:
+            current_time = self.step_count
+            if current_time - self.last_hit_time < 50:  # 50步内连续击中
+                self.combo_count += 1
+                reward += self.combo_count * 0.3  # 连击奖励
+            else:
+                self.combo_count = 1
+            self.last_hit_time = current_time
+        
+        # 9. 弹药管理奖励
+        player_bullets = len([b for b in self.bullets if b.is_player_bullet])
+        if player_bullets == 0 and self.player.cooldown == 0:  # 弹药耗尽且冷却完成
+            reward += 0.1  # 鼓励补充弹药
+        elif player_bullets > 5:  # 弹药过多，浪费
+            reward -= 0.1
         
         self.last_score = self.score
         # 游戏结束条件
